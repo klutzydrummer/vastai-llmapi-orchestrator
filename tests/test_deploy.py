@@ -83,16 +83,23 @@ class FakeVast:
 
     def _post(self, path, json_data=None):
         self.calls.append(("create_workergroup", json_data))
-        self.groups.append({"id": self._id(), "endpoint_id": json_data["endpoint_id"]})
-        return Resp({"success": True})
+        gid = self._id()
+        self.groups.append({"id": gid, "endpoint_id": json_data["endpoint_id"]})
+        return Resp({"success": True, "id": gid})
 
     def delete_workergroup(self, id):
         self.calls.append(("delete_workergroup", id))
         self.groups = [g for g in self.groups if g["id"] != id]
 
     def delete_endpoint(self, id):
+        """Like Vast: deletes the endpoint's workergroups and destroys its workers."""
         self.calls.append(("delete_endpoint", id))
         self.endpoints = [e for e in self.endpoints if e["id"] != id]
+        self.groups = [g for g in self.groups if g["endpoint_id"] != id]
+        gone = [i for i in self.workers if i not in self.sticky]
+        self.instances = [i for i in self.instances if i["id"] not in gone]
+        self.workers = []
+        return {"success": True, "deleted_workers": gone, "failed_workers": []}
 
     def destroy_instance(self, id):
         self.calls.append(("destroy_instance", id))
@@ -161,6 +168,23 @@ def fresh_apply_then_reapply():
     st = deploy.load_state()
     assert st["endpoint_id"] == v.endpoints[0]["id"] and st["workergroup_id"] == v.groups[0]["id"], st
     assert "endpoint_pending" not in st and "workergroup_pending" not in st, st
+
+
+@case
+def workergroup_calls_match_the_sdk():
+    """update passes the raw search (the SDK adds defaults); create sends every limit"""
+    v = FakeVast()
+    apply(v)
+    blob = v.made("create_workergroup")[0][1]
+    e, w = BASE_CFG["endpoint"], BASE_CFG["workergroup"]
+    for k, want in (("max_workers", e["max_workers"]), ("min_load", e["min_load"]),
+                    ("cold_workers", e["cold_workers"]), ("test_workers", w["test_workers"])):
+        assert blob[k] == want, (k, blob)
+    assert blob["search_params"].endswith("verified=True rentable=True rented=False")
+    assert deploy.load_state()["workergroup_id"] == v.groups[0]["id"]
+    apply(v)
+    upd = v.made("update_workergroup")[0][2]
+    assert upd["search_params"] == w["search_params"], upd
 
 
 @case
@@ -375,14 +399,15 @@ def legacy_and_template_ownership():
 # ── destroy ───────────────────────────────────────────────────────────────────
 @case
 def destroy_removes_instances_and_confirms():
-    """destroy deletes group + endpoint, then destroys and confirms every instance"""
+    """destroy deletes the endpoint (Vast takes its workers), then destroys and confirms the rest"""
     v = deployed()
     v.instances = [inst(1), inst(2, age=10), inst(9, env=False)]
     v.workers = [1]
     deploy.vast = lambda: v
     deploy.cmd_destroy(BASE_CFG, args())
-    assert v.made("delete_workergroup") and v.made("delete_endpoint")
-    assert sorted(c[1] for c in v.made("destroy_instance")) == [1, 2]
+    assert v.made("delete_endpoint") and not v.made("delete_workergroup"), v.calls
+    assert not v.groups
+    assert sorted(c[1] for c in v.made("destroy_instance")) == [2]
     assert [i["id"] for i in v.instances] == [9]
     assert "endpoint_id" not in deploy.load_state()
 

@@ -624,27 +624,40 @@ def _apply(v, cfg, pins, opts):
     st.update({"endpoint_id": ep_id, "endpoint_name": e["name"]})
     save_state(st)
 
-    search = (w["search_params"] + " verified=True rentable=True rented=False").strip()
     if groups:
         g = groups[0]
-        v.update_workergroup(g["id"], template_hash=tpl_hash, search_params=search,
+        # The SDK appends its default filters (verified, rentable, not rented)
+        # itself, so pass the configured search unchanged.
+        v.update_workergroup(g["id"], template_hash=tpl_hash, search_params=w["search_params"],
                              gpu_ram=w.get("gpu_ram"), endpoint_id=ep_id)
         say(f"workergroup {g['id']} now uses template {tpl_hash}")
-        say("existing workers keep running the old template until replaced; "
-            "use the dashboard's update-workers (or destroy + apply) to roll them")
+        say(f"existing workers keep running the old template until replaced; roll them with "
+            f"`vastai update workers {g['id']}` (or destroy + apply)")
         st["workergroup_id"] = g["id"]
     else:
         st["workergroup_pending"] = ep_id
         save_state(st)
-        blob = {"client_id": "me", "template_hash": tpl_hash, "search_params": search,
+        # Raw POST /autojobs/ instead of v.create_workergroup(): the REST API
+        # (docs.vast.ai/api-reference/serverless/create-workergroup) takes
+        # test_workers, cold_workers, max_workers and min_load per workergroup,
+        # with defaults of 3 / 3 / 20 / 1, but the SDK's create_workergroup
+        # drops them. Send them all so no Vast default applies. The search
+        # gets the same default filters create_workergroup would add.
+        blob = {"client_id": "me", "template_hash": tpl_hash,
+                "search_params": (w["search_params"] + " verified=True rentable=True rented=False").strip(),
                 "gpu_ram": w.get("gpu_ram"), "endpoint_id": ep_id, "endpoint_name": e["name"],
                 "test_workers": w["test_workers"], "cold_workers": e["cold_workers"],
+                "max_workers": e["max_workers"],
+                **{k: e[k] for k in ("min_load", "target_util", "cold_mult") if k in e},
                 "autoscaler_instance": "prod"}
         r = v.client.post("/autojobs/", json_data=blob)
         r.raise_for_status()
+        res = r.json()
+        if isinstance(res, dict) and res.get("success") is False:
+            raise ApiError(f"workergroup creation refused: {str(res)[:300]}")
         made = _wait_for(lambda: find_workergroups(v, ep_id), f"workergroup for endpoint {ep_id}")
         st.pop("workergroup_pending", None)
-        st["workergroup_id"] = made[0].get("id")
+        st["workergroup_id"] = _created_id(res) or made[0].get("id")
         say(f"workergroup {st['workergroup_id']} created")
     save_state(st)
     say("\ndone. watch it with: deploy.py status   (first worker: download + load + benchmark)")
@@ -740,17 +753,25 @@ def cmd_destroy(cfg, args):
                        "(manual test rentals included)? Cached weights go away.", args.yes):
             return
         failed = []
-        for kind, obj_id, fn in ([("workergroup", g["id"], v.delete_workergroup) for g in groups]
-                                 + ([("endpoint", ep["id"], v.delete_endpoint)] if ep else [])):
+        if ep:
+            # Deleting the endpoint deletes its workergroups and destroys their
+            # workers, reporting deleted_workers / failed_workers
+            # (docs.vast.ai/api-reference/serverless/delete-endpoint). Deleting
+            # a workergroup on its own does not destroy its instances, so the
+            # endpoint goes first and alone.
             try:
-                fn(obj_id)
-                say(f"{kind} {obj_id} deleted")
+                res = v.delete_endpoint(ep["id"])
+                if isinstance(res, dict) and res.get("success") is False:
+                    raise ApiError(str(res)[:300])
+                res = res if isinstance(res, dict) else {}
+                say(f"endpoint {ep['id']} deleted; workers destroyed: {res.get('deleted_workers', '?')}"
+                    + (f", FAILED: {res['failed_workers']}" if res.get("failed_workers") else ""))
             except Exception as e:   # keep going: the instances are what bill
-                say(f"{kind} {obj_id}: delete failed ({e})")
-                failed.append(f"{kind} {obj_id}")
-        # Deleting a workergroup doesn't destroy its instances (per the Vast
-        # SDK), so destroy them here and confirm. A second pass catches any
-        # the autoscaler launched while the groups were being deleted.
+                say(f"endpoint {ep['id']}: delete failed ({e})")
+                failed.append(f"endpoint {ep['id']}")
+        # Destroy and confirm whatever is left: failed_workers, manual
+        # rentals, and anything the endpoint no longer tracked. A second pass
+        # catches workers launched while the endpoint was being deleted.
         done = set()
         for _ in range(2):
             ids = {i["id"] for i in _rows(v.show_instances(), "show_instances") if owned(i, cfg, st)} - done

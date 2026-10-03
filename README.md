@@ -73,8 +73,15 @@ worst case `(max_workers + test_workers) x ceiling` exceeds
   `deploy.py sweep` destroys orphans after asking, and waits until Vast no
   longer lists them. It destroys nothing if the autoscaler can't list its
   workers. Instances without the marker are listed but never touched.
-- Deleting a workergroup doesn't destroy its instances, so `destroy` destroys
-  them itself and waits until they're gone. It exits non-zero if any survive.
+- `destroy` deletes the endpoint, which per Vast's API also deletes its
+  workergroups and destroys their workers. It then destroys anything left
+  (workers Vast reports as failed, manual rentals) and waits until Vast no
+  longer lists them. It exits non-zero if any survive.
+- `apply` creates the workergroup with every limit set explicitly
+  (`test_workers`, `cold_workers`, `max_workers`, `min_load`): the REST API
+  accepts them per workergroup with defaults of 3 / 3 / 20 / 1, but the SDK's
+  `create_workergroup` doesn't pass them, so that one call goes to the API
+  directly.
 
 ## Layout
 
