@@ -31,19 +31,22 @@ the autoscaler drops that worker instead of billing for it.
 | smoke test | `/props` reports vision on; a text request and a **real image request** both return text | fatal |
 | deadline | whole boot finishes within `deadline_s` | fatal |
 | serving | `llama-server` exits later | fatal |
-| after fatal | instance still running `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
+| after fatal | no PyWorker left to report it, `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
 
 Everything remote is pinned when you deploy: model revisions, this repo's
 commit, the llama.cpp image build, the PyWorker commit and the Vast SDK
 version. A cold worker that restarts finds its verified weights on disk and
 skips the download (size + marker check, no re-hash).
 
-After a fatal error the PyWorker should get the worker dropped. If the
-instance is still up `ORCH_FATAL_GRACE` seconds later (the PyWorker never
-started, or it's a manual rental), it destroys itself through the Vast API
-with the instance-scoped `CONTAINER_API_KEY` Vast injects. Manual rentals stop
-instead, so the logs stay on disk. Set `ORCH_FATAL_ACTION=none` to turn this
-off.
+After a fatal error a running PyWorker reports it; Vast marks the worker
+Error, which isn't billed, and the autoscaler handles it, so the worker is
+left alone. When nothing can report the error (the PyWorker never started or
+died), the instance destroys itself `ORCH_FATAL_GRACE` seconds later. This is
+Vast's documented in-container route, `vastai destroy instance $CONTAINER_ID`
+authorised by the per-instance `CONTAINER_API_KEY`, made as the same REST
+call with curl because the llama.cpp image has no `vastai` CLI. Manual
+rentals stop instead, so the logs stay on disk (stopped instances still pay
+for storage). Set `ORCH_FATAL_ACTION=none` to turn this off.
 
 ## Spend limits
 
