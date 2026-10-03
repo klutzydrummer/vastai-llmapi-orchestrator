@@ -1,0 +1,16 @@
+# systemd unit for non-NixOS hosts. Assumes the repo at /opt/vastai-llmapi-orchestrator
+# and a venv at /opt/vastai-llmapi-orchestrator/.venv with shim/requirements.txt installed.
+[Unit]
+Description=OpenAI-compatible shim for Vast Serverless
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/opt/vastai-llmapi-orchestrator/shim/.env
+ExecStart=/opt/vastai-llmapi-orchestrator/.venv/bin/python /opt/vastai-llmapi-orchestrator/shim/shim.py
+Restart=always
+RestartSec=5
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target

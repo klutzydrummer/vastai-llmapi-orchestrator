@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+deploy/config.toml
+deploy/state.json
+shim/.env

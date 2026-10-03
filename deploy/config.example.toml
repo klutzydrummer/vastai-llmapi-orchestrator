@@ -1,0 +1,50 @@
+# Copy to deploy/config.toml and edit. VAST_API_KEY comes from the environment.
+# Every remote reference here (model revisions, this repo's ref, the image tag)
+# is checked by `deploy.py check` and pinned to an exact commit/tag on apply,
+# so a worker started next month boots exactly what you tested today.
+
+[model]
+served_name     = "waifugemma4"          # model id clients see; also used by the benchmark
+repo            = "hiwaifu-research/WaifuGemma4-26b-a4b-v1-i1-GGUF"
+file            = "WaifuGemma4-26b-a4b-v1.i1-Q4_K_M.gguf"
+revision        = "main"                  # resolved to a commit sha on apply
+mmproj_repo     = "hiwaifu-research/WaifuGemma4-26b-a4b-v1-GGUF"
+mmproj_file     = "mmproj-WaifuGemma4-26b-a4b-v1-f16.gguf"
+mmproj_revision = "main"
+
+[llama]
+image            = "ghcr.io/ggml-org/llama.cpp:server-cuda-b11379"   # upstream llama.cpp, pinned build
+ctx              = 32768     # total context; shared by all slots (--kv-unified)
+parallel         = 2         # slots; the Vast benchmark sends concurrent requests
+cache_type       = "q8_0"    # KV cache type for K and V
+reasoning_budget = 0         # the model card says run non-thinking
+extra_args       = ""        # extra llama-server flags, separate with ';'
+min_vram_gb      = 20        # worker refuses to start below this (checked before downloading)
+
+[endpoint]
+name               = "waifugemma4"
+max_workers        = 1       # hard cap on GPUs billed at once
+cold_workers       = 1       # stopped workers kept with weights on disk (storage cost only)
+min_load           = 0       # 0 = allow scaling to zero running workers
+target_util        = 0.9
+cold_mult          = 1.0
+inactivity_timeout = 900     # seconds idle before workers are released; verify in the dashboard
+
+[workergroup]
+test_workers  = 1            # instances spun up to benchmark a new hardware type (default 3)
+gpu_ram       = 24
+# Your constraints live here: price ceiling (dph_total), VRAM floor (gpu_ram),
+# CUDA driver floor for the image (cuda_max_good), download speed (inet_down).
+search_params = "num_gpus=1 gpu_ram>=22 dph_total<=0.40 cuda_max_good>=12.8 inet_down>=500 reliability>0.98 direct_port_count>=1"
+
+[template]
+name    = "llmapi-orchestrator-waifugemma4"
+disk_gb = 40
+
+[boot]
+orch_repo        = "klutzydrummer/vastai-llmapi-orchestrator"
+orch_ref         = "main"    # resolved to a commit sha on apply
+deadline_s       = 2400      # container start -> ready, else the worker reports an error
+load_timeout_s   = 900
+pyworker_ref     = "60cfeca889f979fd73cf9e00adcd7b0ebc016fdc"
+vast_sdk_version = "1.8.3"
