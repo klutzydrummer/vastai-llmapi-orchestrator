@@ -8,14 +8,22 @@
   deploy.py logs      recent endpoint logs from the autoscaler
   deploy.py pause     stop the endpoint (workers go inactive: storage cost only)
   deploy.py resume    reactivate it
-  deploy.py sweep     list instances this tool started that no live worker
-                      accounts for (orphans), and destroy them (asks first)
-  deploy.py destroy   delete workergroup + endpoint, destroy their instances
-                      and wait until they are gone (asks first)
+  deploy.py sweep     destroy orphans: instances recorded as ours (former
+                      workers, test rentals past their TTL) that are no longer
+                      workers; --destroy ID also removes named ones (asks first)
+  deploy.py destroy   delete the endpoint (Vast destroys its workers), destroy
+                      every recorded instance and wait until gone (asks first)
+  deploy.py rent-test rent one instance outside serverless to prove a config,
+                      and record its id
+  deploy.py watch     watchdog loop: destroy workers Vast reports stuck booting
+                      and recorded orphans, pause the endpoint on overspend
+
+Only facts Vast reports drive these: the autoscaler's worker list and the
+instance ids Vast returned, recorded in deploy/state.json. Every create or
+update is read back and compared with what was asked.
 
 Options: --config PATH (default deploy/config.toml), --yes (no prompts),
---dry-run (apply/sweep: show what would happen, change nothing),
---min-age SECONDS (sweep: leave younger instances alone, default 900).
+--dry-run (apply/sweep/rent-test: show what would happen, change nothing).
 Needs VAST_API_KEY in the environment.
 """
 
@@ -74,8 +82,6 @@ def docker_options(cfg, pins):
     """The template's 'Docker options' string: port + env, all pinned."""
     m, l, b = cfg["model"], cfg["llama"], cfg["boot"]
     env = {
-        # Ownership marker: sweep/destroy only ever touch instances carrying it.
-        "ORCH_DEPLOYMENT": cfg["endpoint"]["name"],
         "ORCH_RAW_BASE": f"{GH_RAW}/{b['orch_repo']}",
         "ORCH_REF": pins["orch_ref"],
         "SERVED_MODEL_NAME": m["served_name"],
@@ -124,6 +130,8 @@ def check_limits(cfg):
         val = cfg[section].get(key)
         if not isinstance(val, int) or isinstance(val, bool) or val < 0:
             raise CheckFailed(f"{section}.{key} must be set to a whole number (Vast's default is much higher)")
+    if lim.get("on_breach", "pause") not in ("pause", "alert"):
+        raise CheckFailed("limits.on_breach must be \"pause\" or \"alert\"")
     if e["max_workers"] < 1:
         raise CheckFailed("endpoint.max_workers must be at least 1")
     cap = lim.get("max_workers_cap", 2)
@@ -438,33 +446,55 @@ def confirm(prompt, yes):
     return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
 
 
+# ── verify after write ───────────────────────────────────────────────────────
+def _same(a, b):
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return a == b
+
+
+def _verify(row, want, what):
+    """Compare what Vast now reports with what we asked for. A mismatch is an
+    error; a field Vast doesn't report is named, never assumed applied."""
+    if row is None:
+        raise ApiError(f"{what} is not listed after the change")
+    bad = [f"{k}: asked {val!r}, Vast reports {row[k]!r}" for k, val in want.items()
+           if k in row and not _same(row[k], val)]
+    if bad:
+        raise ApiError(f"{what} did not take the settings: " + "; ".join(bad))
+    missing = [k for k in want if k not in row]
+    if missing:
+        say(f"  warn  Vast doesn't report {', '.join(missing)} for {what}; can't confirm them")
+    else:
+        say(f"  ok    {what} confirmed: " + ", ".join(f"{k}={row[k]}" for k in want))
+    return missing
+
+
+def verify_endpoint(v, ep_id, want):
+    rows = _rows(v.show_endpoints(), "show_endpoints")
+    return _verify(next((r for r in rows if r.get("id") == ep_id), None), want, f"endpoint {ep_id}")
+
+
+def verify_workergroup(v, wg_id, want):
+    rows = _rows(v.show_workergroups(), "show_workergroups")
+    return _verify(next((r for r in rows if r.get("id") == wg_id), None), want, f"workergroup {wg_id}")
+
+
+def endpoint_limits(cfg):
+    e = cfg["endpoint"]
+    return {k: e[k] for k in ("max_workers", "cold_workers", "min_load", "target_util",
+                              "cold_mult", "inactivity_timeout") if k in e}
+
+
 # ── instances ────────────────────────────────────────────────────────────────
-def _env(inst):
-    env = inst.get("extra_env") or {}
-    if isinstance(env, list):
-        env = {p[0]: p[1] for p in env if isinstance(p, (list, tuple)) and len(p) >= 2}
-    return env if isinstance(env, dict) else {}
-
-
-def owned(inst, cfg, st):
-    """True for instances this deployment started: serverless workers and
-    manual test rentals made with the printed docker options."""
-    env = _env(inst)
-    if env.get("ORCH_DEPLOYMENT") == cfg["endpoint"]["name"]:
-        return True
-    # Started before the ORCH_DEPLOYMENT marker existed.
-    if env.get("ORCH_REF") and env.get("SERVED_MODEL_NAME") == cfg["model"]["served_name"]:
-        return True
-    tpl = inst.get("template_hash_id")
-    return bool(tpl) and tpl in st.get("template_hashes", [])
-
-
-def _age(inst):
-    if isinstance(inst.get("duration"), (int, float)):
-        return inst["duration"]
-    if isinstance(inst.get("start_date"), (int, float)):
-        return time.time() - inst["start_date"]
-    return float("inf")
+# Attribution uses only what Vast reports: the autoscaler's worker list for
+# the endpoint, and instance ids Vast returned when this tool created them.
+# Every id ever seen as a worker or created as a test rental is recorded in
+# state.json. Nothing is inferred from env vars, images or templates; anything
+# Vast lists that isn't recorded is "unattributed": shown with its cost, and
+# destroyed only when named explicitly (sweep --destroy ID).
+BOOTING = {"creating", "created", "pending", "loading", "model_loading", "starting"}
 
 
 def _dph(inst):
@@ -474,38 +504,59 @@ def _dph(inst):
         return 0.0
 
 
-def _describe(inst):
-    env = _env(inst)
-    kind = "manual test rental" if env.get("ORCH_SKIP_PYWORKER") == "1" else "worker"
-    age = _age(inst)
-    age_s = "?" if age == float("inf") else f"{age / 60:.0f} min"
-    return (f"instance {inst.get('id')}: {kind}, {inst.get('actual_status') or inst.get('cur_state') or '?'}, "
-            f"{inst.get('gpu_name', '?')}, ${_dph(inst):.3f}/hr, up {age_s}")
+def _status(inst):
+    return str(inst.get("actual_status") or inst.get("cur_state") or "?")
 
 
-def live_worker_ids(v, endpoint_id):
-    """Instance ids the autoscaler counts as this endpoint's workers. Raises
-    when it can't say, so nothing is destroyed on a guess."""
+def _describe(inst, note=""):
+    return (f"instance {inst.get('id')}: {_status(inst)}, {inst.get('gpu_name', '?')}, "
+            f"${_dph(inst):.3f}/hr" + (f", label {inst['label']!r}" if inst.get("label") else "")
+            + (f" ({note})" if note else ""))
+
+
+def endpoint_workers(v, endpoint_id):
+    """The autoscaler's worker rows for this endpoint. Raises when it can't
+    say, so nothing is destroyed on a guess."""
     out = v.get_endpoint_workers(endpoint_id)
     if isinstance(out, dict) and out.get("error_msg"):
         raise ApiError(f"get_endpoint_workers: {out['error_msg']}")
-    return {r.get("id") for r in _rows(out, "get_endpoint_workers") if isinstance(r, dict)}
+    return [r for r in _rows(out, "get_endpoint_workers") if isinstance(r, dict)]
 
 
-def survey(v, cfg, st, ep, min_age):
-    """Sort this deployment's instances into workers, orphans and too-new-to-judge."""
+def survey(v, cfg, st, ep, min_age, now=None):
+    """Sort every instance on the account using recorded facts only.
+
+    Updates st in place: records new worker ids, drops records of instances
+    Vast no longer lists. The caller saves it."""
+    now = now or time.time()
     instances = _rows(v.show_instances(), "show_instances")
-    mine = [i for i in instances if owned(i, cfg, st)]
-    live = live_worker_ids(v, ep["id"]) if ep else set()
-    out = {"workers": [], "orphans": [], "young": [],
-           "others": [i for i in instances if not owned(i, cfg, st)]}
-    for i in mine:
+    workers = endpoint_workers(v, ep["id"]) if ep else []
+    live = {w.get("id") for w in workers}
+    seen = st.setdefault("seen_workers", {})
+    manual = st.setdefault("manual_instances", {})
+    for wid in live:
+        seen.setdefault(str(wid), now)
+    listed = {str(i.get("id")) for i in instances}
+    for k in [k for k in seen if k not in listed and int(k) not in live]:
+        del seen[k]
+    # A rental Vast just created may not be listed yet; forget it only once
+    # it has had time to appear.
+    for k in [k for k in manual if k not in listed and now - manual[k].get("created_at", 0) > 600]:
+        del manual[k]
+    ttl = cfg.get("limits", {}).get("manual_ttl_s", 14400)
+    out = {"workers": [], "manual": [], "orphans": [], "young": [], "unattributed": [], "worker_rows": workers}
+    for i in instances:
+        key = str(i.get("id"))
         if i.get("id") in live:
             out["workers"].append(i)
-        elif _age(i) >= min_age:
-            out["orphans"].append(i)
+        elif key in manual:
+            age = now - manual[key].get("created_at", now)
+            (out["orphans"] if ttl and age >= ttl else out["manual"]).append(i)
+        elif key in seen:
+            # Was a worker of ours, isn't one now.
+            (out["orphans"] if now - seen[key] >= min_age else out["young"]).append(i)
         else:
-            out["young"].append(i)
+            out["unattributed"].append(i)
     return out
 
 
@@ -604,8 +655,7 @@ def _apply(v, cfg, pins, opts):
     save_state(st)
     say(f"template {tpl_hash} ({t['name']})")
 
-    ep_fields = {k: e[k] for k in ("max_workers", "cold_workers", "min_load", "target_util",
-                                   "cold_mult", "inactivity_timeout") if k in e}
+    ep_fields = endpoint_limits(cfg)
     if ep:
         v.update_endpoint(ep["id"], endpoint_name=e["name"], **ep_fields)
         say(f"endpoint {ep['id']} updated")
@@ -623,6 +673,7 @@ def _apply(v, cfg, pins, opts):
         say(f"endpoint {ep_id} created")
     st.update({"endpoint_id": ep_id, "endpoint_name": e["name"]})
     save_state(st)
+    verify_endpoint(v, ep_id, ep_fields)
 
     if groups:
         g = groups[0]
@@ -634,6 +685,8 @@ def _apply(v, cfg, pins, opts):
         say(f"existing workers keep running the old template until replaced; roll them with "
             f"`vastai update workers {g['id']}` (or destroy + apply)")
         st["workergroup_id"] = g["id"]
+        save_state(st)
+        verify_workergroup(v, g["id"], {"template_hash": tpl_hash})
     else:
         st["workergroup_pending"] = ep_id
         save_state(st)
@@ -659,8 +712,35 @@ def _apply(v, cfg, pins, opts):
         st.pop("workergroup_pending", None)
         st["workergroup_id"] = _created_id(res) or made[0].get("id")
         say(f"workergroup {st['workergroup_id']} created")
+        save_state(st)
+        unconfirmed = verify_workergroup(v, st["workergroup_id"], {
+            k: blob[k] for k in ("template_hash", "test_workers", "cold_workers", "max_workers", "min_load")
+            if k in blob})
+        if unconfirmed:
+            say("  the endpoint's own max_workers (confirmed above) still caps workers billed at once")
     save_state(st)
     say("\ndone. watch it with: deploy.py status   (first worker: download + load + benchmark)")
+
+
+def _report(r):
+    for label, key in (("serverless workers (per the autoscaler)", "workers"),
+                       ("test rentals made by rent-test", "manual"),
+                       ("ORPHANS: recorded as ours, no longer a worker, or past their TTL", "orphans"),
+                       ("former workers, too recent to call orphans", "young")):
+        if r[key]:
+            say(f"{label}:")
+            for i in r[key]:
+                say(f"  {_describe(i)}")
+    mine = r["workers"] + r["manual"] + r["orphans"] + r["young"]
+    say(f"this deployment: {len(mine)} instance(s), ${sum(_dph(i) for i in mine):.3f}/hr")
+    if r["unattributed"]:
+        say("instances this tool has no record of (left alone; `sweep --destroy ID` to remove one):")
+        for i in r["unattributed"]:
+            say(f"  {_describe(i)}")
+    total = sum(_dph(i) for i in mine + r["unattributed"])
+    say(f"whole account: ${total:.3f}/hr")
+    if r["orphans"]:
+        say("run `deploy.py sweep` to destroy the orphans")
 
 
 def cmd_status(cfg, args):
@@ -676,27 +756,16 @@ def cmd_status(cfg, args):
             say(json.dumps({k: g.get(k) for k in ("id", "template_hash", "search_params", "gpu_ram",
                                                   "test_workers", "cold_workers")}, indent=2))
     try:
-        r = survey(v, cfg, st, ep, args.min_age)
+        with StateLock():
+            st = load_state()
+            r = survey(v, cfg, st, ep, args.min_age)
+            save_state(st)
     except CheckFailed as e:
         say(f"(could not check instances: {e})")
         return
+    for w in r["worker_rows"]:
+        say(f"worker {w.get('id')}: {w.get('status')}")
     _report(r)
-
-
-def _report(r):
-    for label, key in (("serverless workers", "workers"), ("ORPHANS (no live worker accounts for them)",
-                                                           "orphans"), ("too new to judge", "young")):
-        if r[key]:
-            say(f"{label}:")
-            for i in r[key]:
-                say(f"  {_describe(i)}")
-    mine = r["workers"] + r["orphans"] + r["young"]
-    say(f"this deployment: {len(mine)} instance(s), ${sum(_dph(i) for i in mine):.3f}/hr")
-    if r["others"]:
-        say(f"other instances on the account (left alone): {len(r['others'])}, "
-            f"${sum(_dph(i) for i in r['others']):.3f}/hr")
-    if r["orphans"]:
-        say("run `deploy.py sweep` to destroy the orphans")
 
 
 def cmd_sweep(cfg, args):
@@ -705,17 +774,35 @@ def cmd_sweep(cfg, args):
         st = load_state()
         ep = find_endpoint(v, cfg["endpoint"]["name"], st, allow_state_id=True)
         r = survey(v, cfg, st, ep, args.min_age)
+        save_state(st)
         _report(r)
-        if not r["orphans"]:
-            say("no orphans")
+        targets = list(r["orphans"])
+        if args.destroy:
+            by_id = {i.get("id"): i for i in r["unattributed"] + r["manual"] + r["young"] + r["orphans"]}
+            live = {i.get("id") for i in r["workers"]}
+            for i in args.destroy:
+                if i in live:
+                    raise CheckFailed(f"instance {i} is a live worker of the endpoint; use destroy or pause")
+                if i not in by_id:
+                    raise CheckFailed(f"instance {i} is not on this account")
+                if by_id[i] not in targets:
+                    targets.append(by_id[i])
+        if not targets:
+            say("nothing to destroy")
             return
         if args.dry_run:
             say("dry run: nothing destroyed")
             return
-        cost = sum(_dph(i) for i in r["orphans"])
-        if not confirm(f"destroy {len(r['orphans'])} orphaned instance(s) (${cost:.3f}/hr)?", args.yes):
+        for i in targets:
+            say(f"  will destroy {_describe(i)}")
+        cost = sum(_dph(i) for i in targets)
+        if not confirm(f"destroy {len(targets)} instance(s) (${cost:.3f}/hr)?", args.yes):
             return
-        destroy_and_wait(v, [i["id"] for i in r["orphans"]])
+        destroy_and_wait(v, [i["id"] for i in targets])
+        for i in targets:
+            st["seen_workers"].pop(str(i["id"]), None)
+            st["manual_instances"].pop(str(i["id"]), None)
+        save_state(st)
 
 
 def cmd_logs(cfg, args):
@@ -727,13 +814,21 @@ def cmd_logs(cfg, args):
     say(json.dumps(out, indent=2) if not isinstance(out, str) else out)
 
 
+def set_endpoint_state(v, cfg, ep, state):
+    # Send every configured limit with the new state, so nothing depends on
+    # how Vast treats fields an update leaves out, then read it back.
+    v.update_endpoint(ep["id"], endpoint_name=cfg["endpoint"]["name"], endpoint_state=state,
+                      **endpoint_limits(cfg))
+    verify_endpoint(v, ep["id"], {"endpoint_state": state, **endpoint_limits(cfg)})
+    say(f"endpoint {ep['id']} -> {state}")
+
+
 def _set_state(cfg, state):
     v = vast()
     ep = find_endpoint(v, cfg["endpoint"]["name"], load_state(), allow_state_id=True)
     if not ep:
         raise SystemExit("endpoint not found")
-    v.update_endpoint(ep["id"], endpoint_name=cfg["endpoint"]["name"], endpoint_state=state)
-    say(f"endpoint {ep['id']} -> {state}")
+    set_endpoint_state(v, cfg, ep, state)
 
 
 def cmd_destroy(cfg, args):
@@ -742,15 +837,24 @@ def cmd_destroy(cfg, args):
         st = load_state()
         ep = find_endpoint(v, cfg["endpoint"]["name"], st, allow_state_id=True)
         groups = find_workergroups(v, ep["id"]) if ep else []
-        mine = [i for i in _rows(v.show_instances(), "show_instances") if owned(i, cfg, st)]
+        try:
+            r = survey(v, cfg, st, ep, 0)
+        except ApiError as e:
+            # Deleting the endpoint destroys its workers anyway; go on with
+            # what state.json recorded.
+            say(f"warn: {e}; continuing with recorded instances only")
+            r = survey(v, cfg, st, None, 0)
+        save_state(st)
+        mine = r["workers"] + r["manual"] + r["orphans"] + r["young"]
         if not ep and not groups and not mine:
-            say("no endpoint and no instances from this deployment; nothing to do")
+            say("no endpoint and no recorded instances from this deployment; nothing to do")
+            _report(r)
             return
         for i in mine:
             say(f"  {_describe(i)}")
         what = f"endpoint {ep['id']} and {len(groups)} workergroup(s)" if ep else "no endpoint (already gone)"
-        if not confirm(f"delete {what}, and destroy {len(mine)} instance(s) listed above "
-                       "(manual test rentals included)? Cached weights go away.", args.yes):
+        if not confirm(f"delete {what}, and destroy the {len(mine)} instance(s) listed above "
+                       "(test rentals included)? Cached weights go away.", args.yes):
             return
         failed = []
         if ep:
@@ -766,43 +870,168 @@ def cmd_destroy(cfg, args):
                 res = res if isinstance(res, dict) else {}
                 say(f"endpoint {ep['id']} deleted; workers destroyed: {res.get('deleted_workers', '?')}"
                     + (f", FAILED: {res['failed_workers']}" if res.get("failed_workers") else ""))
+                for wid in res.get("failed_workers") or []:
+                    st["seen_workers"].setdefault(str(wid), time.time())
             except Exception as e:   # keep going: the instances are what bill
                 say(f"endpoint {ep['id']}: delete failed ({e})")
                 failed.append(f"endpoint {ep['id']}")
-        # Destroy and confirm whatever is left: failed_workers, manual
-        # rentals, and anything the endpoint no longer tracked. A second pass
+        # Destroy and confirm every recorded instance Vast still lists:
+        # failed_workers, test rentals, workers seen earlier. A second pass
         # catches workers launched while the endpoint was being deleted.
         done = set()
         for _ in range(2):
-            ids = {i["id"] for i in _rows(v.show_instances(), "show_instances") if owned(i, cfg, st)} - done
+            listed = {i.get("id") for i in _rows(v.show_instances(), "show_instances")}
+            recorded = {int(k) for k in st["seen_workers"]} | {int(k) for k in st["manual_instances"]}
+            if ep and not failed:
+                try:
+                    recorded |= {w.get("id") for w in endpoint_workers(v, ep["id"])}
+                except Exception:
+                    pass   # endpoint gone, as intended
+            ids = (recorded & listed) - done
             if not ids:
                 break
             destroy_and_wait(v, ids)
             done |= ids
         if failed:
-            raise CheckFailed(f"instances are gone, but deleting {', '.join(failed)} failed; the autoscaler "
-                              "may start new workers. Re-run destroy or delete them in the dashboard")
+            raise CheckFailed(f"recorded instances are gone, but deleting {', '.join(failed)} failed; the "
+                              "autoscaler may start new workers. Re-run destroy or delete it in the dashboard")
         for k in ("endpoint_id", "endpoint_name", "workergroup_id", "endpoint_pending", "workergroup_pending"):
             st.pop(k, None)
+        st["seen_workers"], st["manual_instances"] = {}, {}
         save_state(st)
-        say("destroyed; no instances from this deployment remain")
+        say("destroyed; no recorded instances from this deployment remain")
+        if r["unattributed"]:
+            say(f"{len(r['unattributed'])} instance(s) on the account were never recorded by this tool and "
+                "were left alone; see `deploy.py status`")
+
+
+def cmd_rent_test(cfg, args):
+    """Rent one instance outside serverless (no PyWorker) to prove a config,
+    recording the id Vast returns so status, sweep, watch and destroy know it."""
+    v = vast()
+    say("preflight")
+    pins = check(cfg, v)
+    ttl = int(cfg["limits"].get("manual_ttl_s", 14400))
+    opts = docker_options(cfg, pins) + f" -e ORCH_SKIP_PYWORKER=1 -e ORCH_MANUAL_TTL={ttl}"
+    t, w = cfg["template"], cfg["workergroup"]
+    offers = _rows(v.search_offers(query=w["search_params"] + " rented=False", order="dph_total",
+                                   limit=1, storage=t["disk_gb"]), "search_offers")
+    if not offers:
+        raise CheckFailed("no offer matches workergroup.search_params right now")
+    o = offers[0]
+    say(f"cheapest match: offer {o.get('id')} {o.get('gpu_name', '?')} ${o.get('dph_total', 0):.3f}/hr")
+    if args.dry_run:
+        say("docker options:\n  " + opts + "\ndry run: nothing rented")
+        return
+    if not confirm(f"rent it? It stops itself after {ttl}s; `deploy.py destroy` or `sweep` removes it.", args.yes):
+        return
+    label = f"orch-test:{cfg['endpoint']['name']}"
+    with StateLock():
+        st = load_state()
+        res = v.create_instance(o["id"], image=cfg["llama"]["image"], disk=float(t["disk_gb"]), env=opts,
+                                onstart_cmd=onstart_script(), label=label, ssh=True, direct=True,
+                                cancel_unavail=True)
+        iid = res.get("new_contract") if isinstance(res, dict) else None
+        if not isinstance(iid, int):
+            raise ApiError(f"create_instance returned no instance id: {str(res)[:300]}. Check the dashboard "
+                           f"for an instance labelled {label!r} and destroy it if present")
+        st.setdefault("manual_instances", {})[str(iid)] = {"created_at": time.time(), "label": label}
+        save_state(st)
+        say(f"instance {iid} rented and recorded")
+        inst = _wait_for(lambda: next((i for i in _rows(v.show_instances(), "show_instances")
+                                       if i.get("id") == iid), None), f"instance {iid}")
+        say(f"  {_describe(inst)}")
+    say("follow the boot with: vastai logs " + str(iid))
+
+
+# ── watch ────────────────────────────────────────────────────────────────────
+def watch_tick(v, cfg, st, now=None):
+    """One pass of the watchdog. Acts only on what Vast reports; returns the
+    actions taken (for logs and tests)."""
+    now = now or time.time()
+    actions = []
+    ep = find_endpoint(v, cfg["endpoint"]["name"], st, allow_state_id=True)
+    r = survey(v, cfg, st, ep, cfg.get("limits", {}).get("orphan_min_age_s", 900), now)
+
+    # 1. Workers Vast still reports as booting long past our own boot
+    #    deadline: they bill (Creating/Loading/Starting are billed states) and
+    #    will not become ready. Status strings we don't know are left alone.
+    limit = cfg["boot"]["deadline_s"] + cfg.get("limits", {}).get("stuck_grace_s", 600)
+    stuck = [w for w in r["worker_rows"] if str(w.get("status", "")).lower() in BOOTING
+             and now - st["seen_workers"].get(str(w.get("id")), now) >= limit]
+    # 2. Instances recorded as ours that are no longer workers, or test
+    #    rentals past their TTL.
+    targets = {w.get("id") for w in stuck} | {i.get("id") for i in r["orphans"]}
+    for w in stuck:
+        actions.append(f"destroy stuck worker {w.get('id')} ({w.get('status')} for >{limit}s)")
+    for i in r["orphans"]:
+        actions.append(f"destroy orphan {_describe(i)}")
+    if targets:
+        destroy_and_wait(v, targets)
+        for i in targets:
+            st["seen_workers"].pop(str(i), None)
+            st["manual_instances"].pop(str(i), None)
+
+    # 3. Whole-account spend, from Vast's own dph_total, against the budget.
+    budget = float(cfg["limits"]["max_hourly_usd"])
+    running = [i for i in r["workers"] + r["manual"] + r["young"] + r["unattributed"]
+               if i.get("id") not in targets and _status(i) == "running"]
+    burn = sum(_dph(i) for i in running)
+    if burn > budget + 1e-9:
+        msg = f"account burn ${burn:.3f}/hr is over limits.max_hourly_usd={budget:.2f}"
+        if ep and cfg["limits"].get("on_breach", "pause") == "pause" and ep.get("endpoint_state") != "stopped":
+            set_endpoint_state(v, cfg, ep, "stopped")
+            actions.append(msg + "; endpoint paused (resume with `deploy.py resume`)")
+        else:
+            actions.append(msg + "; alert only")
+    for a in actions:
+        say(f"[watch] {a}")
+    return actions
+
+
+def cmd_watch(cfg, args):
+    check_limits(cfg)
+    v = vast()
+    say(f"[watch] every {args.interval:.0f}s; acting only on what Vast reports")
+    while True:
+        try:
+            with StateLock():
+                st = load_state()
+                try:
+                    watch_tick(v, cfg, st)
+                finally:
+                    save_state(st)
+        except Exception as e:   # keep watching; say plainly what we couldn't see
+            say(f"[watch] could not check Vast this round: {e}")
+            if args.once:
+                raise
+        if args.once:
+            return
+        time.sleep(args.interval)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["check", "apply", "status", "logs", "pause", "resume", "sweep", "destroy"])
+    p.add_argument("command", choices=["check", "apply", "status", "logs", "pause", "resume", "sweep",
+                                       "destroy", "rent-test", "watch"])
     p.add_argument("--config", default=os.path.join(HERE, "config.toml"))
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--min-age", type=float, default=900,
-                   help="sweep/status: instances younger than this many seconds are never called orphans")
+                   help="sweep/status: a former worker must be gone from the worker list this long "
+                        "(seconds) before it counts as an orphan")
+    p.add_argument("--destroy", type=int, nargs="+", default=[], metavar="ID",
+                   help="sweep: also destroy these instance ids (e.g. ones listed as unrecorded)")
+    p.add_argument("--interval", type=float, default=60, help="watch: seconds between checks")
+    p.add_argument("--once", action="store_true", help="watch: one check, then exit")
     args = p.parse_args()
     cfg = load_config(args.config)
     try:
         {"check": cmd_check, "apply": cmd_apply, "status": cmd_status, "logs": cmd_logs,
          "pause": lambda c, a: _set_state(c, "stopped"),
          "resume": lambda c, a: _set_state(c, "active"),
-         "sweep": cmd_sweep, "destroy": cmd_destroy}[args.command](cfg, args)
+         "sweep": cmd_sweep, "destroy": cmd_destroy, "rent-test": cmd_rent_test,
+         "watch": cmd_watch}[args.command](cfg, args)
     except CheckFailed as e:
         say(f"\n{e}")
         sys.exit(1)
