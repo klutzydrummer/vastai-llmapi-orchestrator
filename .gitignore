@@ -4,3 +4,5 @@ __pycache__/
 deploy/config.toml
 deploy/state.json
 shim/.env
+deploy/state.json.lock
+deploy/state.json.tmp

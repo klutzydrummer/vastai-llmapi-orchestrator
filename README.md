@@ -31,16 +31,47 @@ the autoscaler drops that worker instead of billing for it.
 | smoke test | `/props` reports vision on; a text request and a **real image request** both return text | fatal |
 | deadline | whole boot finishes within `deadline_s` | fatal |
 | serving | `llama-server` exits later | fatal |
+| after fatal | instance still running `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
 
 Everything remote is pinned when you deploy: model revisions, this repo's
 commit, the llama.cpp image build, the PyWorker commit and the Vast SDK
 version. A cold worker that restarts finds its verified weights on disk and
 skips the download (size + marker check, no re-hash).
 
+After a fatal error the PyWorker should get the worker dropped. If the
+instance is still up `ORCH_FATAL_GRACE` seconds later (the PyWorker never
+started, or it's a manual rental), it destroys itself through the Vast API
+with the instance-scoped `CONTAINER_API_KEY` Vast injects. Manual rentals stop
+instead, so the logs stay on disk. Set `ORCH_FATAL_ACTION=none` to turn this
+off.
+
+## Spend limits
+
 Spend limits live in `deploy/config.toml`: `max_workers = 1` caps GPUs billed
 at once, `dph_total<=` in `search_params` caps the hourly price,
-`test_workers = 1` limits benchmark instances (Vast's default is 3), and
-`min_load = 0` lets it scale to zero running workers.
+`test_workers = 1` limits benchmark instances, and `min_load = 0` lets it
+scale to zero running workers. Vast's own defaults are much higher
+(`max_workers` 20, `cold_workers` 5, `test_workers` 3), so `check` refuses a
+config that leaves any of them out, has no `dph_total<=` ceiling, or whose
+worst case `(max_workers + test_workers) x ceiling` exceeds
+`[limits] max_hourly_usd`.
+
+## Duplicates and orphans
+
+- `apply` treats any error or odd answer from the Vast API as a stop, never as
+  "nothing exists". It refuses when two endpoints share the name, when the
+  endpoint has more than one workergroup, or when the endpoint recorded in
+  `deploy/state.json` was renamed. It records each endpoint and workergroup in
+  `state.json` before creating it, so a re-run after a crash refuses instead of
+  creating a second one. A lock file stops two runs racing.
+- Every instance carries `ORCH_DEPLOYMENT=<endpoint name>`. `deploy.py status`
+  lists them with their hourly cost and flags orphans: marked instances older
+  than `--min-age` (15 min) that the autoscaler doesn't count as workers.
+  `deploy.py sweep` destroys orphans after asking, and waits until Vast no
+  longer lists them. It destroys nothing if the autoscaler can't list its
+  workers. Instances without the marker are listed but never touched.
+- Deleting a workergroup doesn't destroy its instances, so `destroy` destroys
+  them itself and waits until they're gone. It exits non-zero if any survive.
 
 ## Layout
 
@@ -78,6 +109,8 @@ curl -s localhost:18000/v1/chat/completions -H 'Content-Type: application/json' 
 ```
 
 Destroy it when you're happy. That run is the reference for everything after.
+A manual rental stops itself after `ORCH_MANUAL_TTL` seconds (default 4 hours;
+`-e ORCH_MANUAL_TTL=0` to disable), and `deploy.py sweep` finds one you forgot.
 
 ### 2. Deploy
 
@@ -89,8 +122,8 @@ python3 deploy/deploy.py status           # first worker: download, load, smoke 
 ```
 
 `check` must pass before `apply` changes anything. `deploy/state.json` records
-what was created. Other commands: `logs`, `pause` (workers go inactive, storage
-cost only), `resume`, `destroy`.
+what was created; keep it. Other commands: `logs`, `pause` (workers go inactive,
+storage cost only), `resume`, `sweep` (destroy orphaned instances), `destroy`.
 
 The repo must be public, and the commit you deploy must be pushed: workers
 fetch their scripts from `raw.githubusercontent.com` at that commit. For gated
@@ -143,6 +176,8 @@ states.
 tests/run_all.sh
 ```
 
-These run the real `boot.sh` against a fake Hub, fake GPU and fake
-llama-server through every failure mode, and run the real shim with the real
-vastai SDK client against a fake autoscaler and worker.
+These run the real `boot.sh` against a fake Hub, fake GPU, fake llama-server
+and fake Vast API through every failure mode, run the real shim with the real
+vastai SDK client against a fake autoscaler and worker, and run `deploy.py`'s
+apply, sweep, destroy and spend checks against an in-memory fake of the Vast
+API.
