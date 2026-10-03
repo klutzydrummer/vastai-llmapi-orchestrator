@@ -42,11 +42,59 @@ export LD_LIBRARY_PATH="$(dirname "$LLAMA_SERVER_BIN")${LD_LIBRARY_PATH:+:$LD_LI
 
 log(){ echo "[$(date -u '+%H:%M:%S')] [boot] $*" | tee -a "$MODEL_LOG"; }
 
+# ── stop paying for a dead worker ─────────────────────────────────────────────
+# After ORCH_FATAL the PyWorker reports the error and the autoscaler should
+# drop this instance. If it is still running ORCH_FATAL_GRACE seconds later
+# (the PyWorker never came up, or this is a manual rental), the instance
+# stops or destroys itself with the instance-scoped key Vast injects.
+VAST_URL="${VAST_URL:-https://console.vast.ai}"
+ORCH_FATAL_GRACE="${ORCH_FATAL_GRACE:-600}"
+if [ "$ORCH_SKIP_PYWORKER" = "1" ]; then _default_action=stop; else _default_action=destroy; fi
+ORCH_FATAL_ACTION="${ORCH_FATAL_ACTION:-$_default_action}"   # destroy | stop | none
+ORCH_MANUAL_TTL="${ORCH_MANUAL_TTL:-14400}"   # manual rental stops itself after this many seconds; 0 = never
+CLEANUP_MARK="$ORCH_DIR/.cleanup-scheduled"
+
+self_terminate(){   # $1 = destroy|stop, $2 = why
+    local action="$1" why="$2" url code i
+    if [ -z "${CONTAINER_ID:-}" ] || [ -z "${CONTAINER_API_KEY:-}" ]; then
+        log "warn: $why, but CONTAINER_ID/CONTAINER_API_KEY are unset; can't $action this instance"
+        return 1
+    fi
+    url="$VAST_URL/api/v0/instances/$CONTAINER_ID/"
+    log "$why: asking Vast to $action instance $CONTAINER_ID"
+    for i in 1 2 3; do
+        if [ "$action" = destroy ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE \
+                -H "Authorization: Bearer $CONTAINER_API_KEY" -H 'Content-Type: application/json' -d '{}' "$url")
+        else
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X PUT \
+                -H "Authorization: Bearer $CONTAINER_API_KEY" -H 'Content-Type: application/json' \
+                -d '{"state":"stopped"}' "$url")
+        fi
+        case "$code" in 2*) log "instance $CONTAINER_ID: $action accepted"; return 0;; esac
+        log "warn: $action returned HTTP $code (attempt $i)"
+        sleep $((i * 10))
+    done
+    return 1
+}
+
+schedule_fatal_cleanup(){
+    [ "$ORCH_FATAL_ACTION" = none ] && return 0
+    mkdir "$CLEANUP_MARK" 2>/dev/null || return 0   # once per boot
+    (
+        sleep "$ORCH_FATAL_GRACE"
+        # A new boot rewrites the state file; only act on this boot's failure.
+        [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] || exit 0
+        self_terminate "$ORCH_FATAL_ACTION" "still running ${ORCH_FATAL_GRACE}s after $FATAL_MARK"
+    ) </dev/null >/dev/null 2>&1 &
+}
+
 LLAMA_PID=""
 fatal(){
     echo "fatal" > "$STATE_FILE"
     echo "[$(date -u '+%H:%M:%S')] [boot] $FATAL_MARK: $*" | tee -a "$MODEL_LOG" >&2
     [ -n "$LLAMA_PID" ] && kill "$LLAMA_PID" 2>/dev/null
+    schedule_fatal_cleanup
     exit 1
 }
 
@@ -56,7 +104,16 @@ fatal(){
 [ -f "$MODEL_LOG" ] && mv -f "$MODEL_LOG" "$MODEL_LOG.prev"
 : > "$MODEL_LOG"
 echo "booting" > "$STATE_FILE"
+rmdir "$CLEANUP_MARK" 2>/dev/null
 log "boot start (orch ref ${ORCH_REF:-unknown})"
+
+# ── manual rentals don't run forever ──────────────────────────────────────────
+if [ "$ORCH_SKIP_PYWORKER" = "1" ] && [ "$ORCH_MANUAL_TTL" -gt 0 ] 2>/dev/null; then
+    log "manual mode: this instance stops itself after ${ORCH_MANUAL_TTL}s (ORCH_MANUAL_TTL, 0 = never)"
+    ( sleep "$ORCH_MANUAL_TTL"
+      self_terminate stop "manual rental reached ORCH_MANUAL_TTL=${ORCH_MANUAL_TTL}s"
+    ) </dev/null >/dev/null 2>&1 &
+fi
 
 # ── boot deadline watchdog ────────────────────────────────────────────────────
 (
@@ -64,6 +121,7 @@ log "boot start (orch ref ${ORCH_REF:-unknown})"
     if [ "$(cat "$STATE_FILE" 2>/dev/null)" = "booting" ]; then
         echo "fatal" > "$STATE_FILE"
         echo "[$(date -u '+%H:%M:%S')] [boot] $FATAL_MARK: not ready within ${BOOT_DEADLINE}s" >> "$MODEL_LOG"
+        schedule_fatal_cleanup
         pkill -f "$LLAMA_SERVER_BIN" 2>/dev/null
     fi
 ) &

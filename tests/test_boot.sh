@@ -7,9 +7,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 WORK="$(mktemp -d)"
 HF_PORT=18999
+VAST_PORT=18998
 PASS=0; FAIL=0
-HF_PID=""
-trap '[ -n "$HF_PID" ] && kill "$HF_PID" 2>/dev/null; pkill -f fake_llama_server.py 2>/dev/null; rm -rf "$WORK"' EXIT
+HF_PID=""; VAST_PID=""
+trap '[ -n "$HF_PID" ] && kill "$HF_PID" 2>/dev/null; [ -n "$VAST_PID" ] && kill "$VAST_PID" 2>/dev/null; pkill -f fake_llama_server.py 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # fake weights: GGUF magic + filler
 mkdir -p "$WORK/hub" "$WORK/bin"
@@ -38,6 +39,7 @@ start_hub(){
 }
 
 # run_case NAME EXPECT(ready|fatal|ready_then_fatal) TIMEOUT [ENV=VAL...]
+# HOLD=N keeps the boot running N more seconds after the marker shows up.
 run_case(){
     local name="$1" expect="$2" timeout="$3"; shift 3
     local orch="$WORK/orch"
@@ -62,6 +64,7 @@ run_case(){
         fi
         sleep 0.5
     done
+    [ -n "$got" ] && sleep "${HOLD:-0}"
     kill -- -"$pid" 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; wait "$pid" 2>/dev/null
     if [ "$got" = "$expect" ]; then
         echo "PASS  $name ($got)"; PASS=$((PASS + 1))
@@ -100,6 +103,46 @@ run_case "checksum mismatch rejected" fatal 40
 [ -e "$WORK/models/test__repo/model.gguf" ] \
     && { echo "FAIL  corrupt file left on disk"; FAIL=$((FAIL+1)); } \
     || { echo "PASS  corrupt file removed"; PASS=$((PASS+1)); }
+
+# ── instance stops/destroys itself instead of billing ────────────────────────
+VAST_LOG="$WORK/vast_calls.log"
+python3 "$HERE/fakes/fake_vast_api.py" "$VAST_PORT" "$VAST_LOG" & VAST_PID=$!
+for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$VAST_PORT/" && break; sleep 0.1; done
+start_hub
+SELF=(CONTAINER_ID=4242 CONTAINER_API_KEY=inst-key VAST_URL="http://127.0.0.1:$VAST_PORT" ORCH_FATAL_GRACE=1)
+expect_call(){   # NAME PATTERN
+    if grep -q -- "$2" "$VAST_LOG" 2>/dev/null; then echo "PASS  $1"; PASS=$((PASS+1))
+    else echo "FAIL  $1: no call matching '$2'"; sed 's/^/      /' "$VAST_LOG" 2>/dev/null; FAIL=$((FAIL+1)); fi
+}
+
+: > "$VAST_LOG"
+HOLD=4 run_case "manual rental fails" fatal 30 "${SELF[@]}" MODEL_FILE=nope.gguf
+expect_call "failed manual rental stops itself" 'PUT /api/v0/instances/4242/ Bearer inst-key {"state":"stopped"}'
+
+: > "$VAST_LOG"
+HOLD=4 run_case "serverless-style failure" fatal 30 "${SELF[@]}" ORCH_FATAL_ACTION=destroy MODEL_FILE=nope.gguf
+expect_call "failed worker destroys itself" 'DELETE /api/v0/instances/4242/ Bearer inst-key'
+
+: > "$VAST_LOG"
+HOLD=4 run_case "boot deadline with self-cleanup" fatal 30 "${SELF[@]}" ORCH_FATAL_ACTION=destroy \
+    FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
+expect_call "deadline failure destroys the instance" 'DELETE /api/v0/instances/4242/'
+[ "$(grep -c DELETE "$VAST_LOG")" -eq 1 ] && { echo "PASS  cleanup requested once"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  expected one DELETE, got $(grep -c DELETE "$VAST_LOG")"; FAIL=$((FAIL+1)); }
+
+: > "$VAST_LOG"
+HOLD=4 run_case "healthy manual rental with a short TTL" ready 60 "${SELF[@]}" ORCH_MANUAL_TTL=2
+expect_call "manual rental stops itself at its TTL" 'PUT /api/v0/instances/4242/ Bearer inst-key {"state":"stopped"}'
+
+: > "$VAST_LOG"
+HOLD=3 run_case "healthy manual rental, default TTL" ready 60 "${SELF[@]}"
+[ -s "$VAST_LOG" ] && { echo "FAIL  healthy worker called the Vast API"; FAIL=$((FAIL+1)); } \
+    || { echo "PASS  healthy worker leaves itself running"; PASS=$((PASS+1)); }
+
+: > "$VAST_LOG"
+HOLD=4 run_case "fatal with ORCH_FATAL_ACTION=none" fatal 30 "${SELF[@]}" ORCH_FATAL_ACTION=none MODEL_FILE=nope.gguf
+[ -s "$VAST_LOG" ] && { echo "FAIL  ORCH_FATAL_ACTION=none still called the API"; FAIL=$((FAIL+1)); } \
+    || { echo "PASS  ORCH_FATAL_ACTION=none leaves the instance alone"; PASS=$((PASS+1)); }
 
 echo "---- $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
