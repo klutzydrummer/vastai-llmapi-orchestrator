@@ -9,7 +9,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/opt/vastai-llmapi-orchestrator
-EnvironmentFile=/etc/llmapi-shim.env
+EnvironmentFile=/opt/vastai-llmapi-orchestrator/shim/.env
 ExecStart=/opt/vastai-llmapi-orchestrator/.venv/bin/python3 deploy/deploy.py watch --interval 60
 Restart=always
 RestartSec=30

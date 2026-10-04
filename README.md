@@ -68,7 +68,7 @@ itself reports, never on an inference:
 - **Ownership comes from Vast's answers.** Serverless workers are the ids the
   autoscaler lists for the endpoint (`get_endpoint_workers`). Test rentals are
   made by `deploy.py rent-test`, which records the instance id Vast returns.
-  Both go into `deploy/state.json`. Anything else on the account is
+  Both go into `state.json` (in Docker, the `orch-state` volume). Anything else on the account is
   "unrecorded": `status` shows it with its cost, and only
   `sweep --destroy ID` removes it.
 - **Every write is read back.** After creating or updating the endpoint or
@@ -118,24 +118,45 @@ worker/smoke_test.py    /props + text + image checks
 shim/shim.py            OpenAI-compatible proxy (vastai SDK client)
 deploy/deploy.py        preflight, template / endpoint / workergroup, rent-test, sweep, watch, destroy
 deploy/orch-watch.service  systemd unit for `deploy.py watch`
+Dockerfile, compose.yaml   one image: shim, watchdog and deploy CLI
 tests/                  fakes for the Hub, GPU, llama-server, autoscaler and worker
 ```
 
 ## Setup
 
-You need Python 3.11+ and a Vast API key.
+You need a Vast API key. The simplest way to run everything is Docker: one
+image holds the shim, the watchdog and the deploy commands.
+
+```bash
+cp deploy/config.example.toml deploy/config.toml   # do this before compose, or Docker
+cp shim/config.example.env shim/.env               # mounts an empty directory instead
+# fill in both: VAST_API_KEY, SHIM_API_KEY, endpoint/model names, [limits]
+docker compose build
+alias orch='docker compose run --rm deploy'        # orch check, orch apply, ...
+```
+
+`deploy.py` keeps its record of what it created (`state.json`) in the
+`orch-state` volume, not in the checkout. Don't delete that volume while
+anything is deployed. To back it up:
+
+```bash
+docker compose run --rm --entrypoint cat deploy /data/state.json > state-backup.json
+```
+
+Without Docker (Python 3.11+):
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r shim/requirements.txt
-export VAST_API_KEY=...
 cp deploy/config.example.toml deploy/config.toml
+set -a; . shim/.env; set +a
+alias orch='python3 deploy/deploy.py'
 ```
 
 ### 1. Prove it on one test rental first (recommended)
 
 ```bash
-python3 deploy/deploy.py rent-test        # cheapest matching offer, no serverless; records the id
+orch rent-test        # cheapest matching offer, no serverless; records the id
 ```
 
 Then, on the instance (`vastai ssh-url <id>`):
@@ -153,13 +174,13 @@ That run is the reference for everything after. Remove it with
 ### 2. Deploy
 
 ```bash
-python3 deploy/deploy.py check            # changes nothing; prints matching offers and prices
-python3 deploy/deploy.py apply --dry-run  # shows the pinned template settings
-python3 deploy/deploy.py apply
-python3 deploy/deploy.py status           # first worker: download, load, smoke test, Vast benchmark
+orch check            # changes nothing; prints matching offers and prices
+orch apply --dry-run  # shows the pinned template settings
+orch apply
+orch status           # first worker: download, load, smoke test, Vast benchmark
 ```
 
-`check` must pass before `apply` changes anything. `deploy/state.json` records
+`check` must pass before `apply` changes anything. The state file records
 what was created; keep it. Other commands: `logs`, `pause` (workers go inactive,
 storage cost only), `resume`, `sweep` (destroy orphaned instances), `destroy`,
 `watch` (the watchdog; run it as a service next to the shim).
@@ -169,34 +190,45 @@ fetch their scripts from `raw.githubusercontent.com` at that commit. For gated
 Hugging Face repos, set `HF_TOKEN` in your Vast account's environment
 variables, not in the template.
 
-### 3. Run the shim at home
+### 3. Run the shim and watchdog at home
 
 ```bash
-cp shim/config.example.env shim/.env      # VAST_API_KEY, ENDPOINT_NAME, ...
-set -a; . shim/.env; set +a
-python3 shim/shim.py
+docker compose up -d                       # shim on :8787 + watchdog, restarted on boot
+docker compose logs -f watch               # "[watch]" lines show every action it takes
 ```
 
-On NixOS, the Dockerfile in `shim/` works with `virtualisation.oci-containers`:
+Both containers stay up with `restart: unless-stopped`. Stopping the watchdog
+container mid-check is safe: its state lock is an flock the kernel drops.
+
+On NixOS, the same image works with `virtualisation.oci-containers`
+(`docker build -t vastai-llmapi-orchestrator .` first):
 
 ```nix
-virtualisation.oci-containers.containers.llmapi-shim = {
-  image = "llmapi-shim:latest";          # docker build -t llmapi-shim shim/
-  ports = [ "8787:8787" ];
-  environmentFiles = [ /etc/llmapi-shim.env ];
+virtualisation.oci-containers.containers = let
+  orch = cmd: {
+    image = "vastai-llmapi-orchestrator:latest";
+    cmd = cmd;
+    environmentFiles = [ /etc/llmapi-shim.env ];
+    volumes = [ "orch-state:/data" "/etc/orch/config.toml:/config/config.toml:ro" ];
+  };
+in {
+  llmapi-shim = orch [ "shim" ] // { ports = [ "8787:8787" ]; };
+  orch-watch  = orch [ "watch" "--interval" "60" ];
 };
 ```
 
-`shim/llmapi-shim.service` is a plain systemd unit for other hosts.
+Without Docker, `shim/llmapi-shim.service` and `deploy/orch-watch.service` are
+plain systemd units (both read `shim/.env`).
 
 ### 4. SillyTavern
 
 Chat Completion → Custom (OpenAI-compatible): base URL `http://<homelab>:8787/v1`,
 API key = `SHIM_API_KEY` (anything if unset), model = `served_name`.
 
-The first message after an idle period waits for a worker. Expect a few
-minutes when a cold worker resumes, longer when a fresh machine has to download
-~18 GB. Streaming shows nothing until the worker is up, then flows normally.
+The first message after an idle period waits for a worker. The example config
+keeps no stopped workers (`cold_workers = 0`), so every start downloads ~18 GB
+on a fresh machine; set `cold_workers = 1` to keep one stopped worker with the
+weights on disk (storage cost only), which resumes in a few minutes. Streaming shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
 
