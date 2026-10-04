@@ -25,3 +25,4 @@ python3 -m py_compile worker/fetch_model.py worker/smoke_test.py shim/shim.py de
 run 600 bash tests/test_boot.sh
 run 120 python3 tests/test_shim.py
 run 120 python3 tests/test_deploy.py
+run 60 python3 tests/test_fetch.py

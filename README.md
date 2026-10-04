@@ -30,7 +30,7 @@ the autoscaler drops that worker instead of billing for it.
 | Stage | Check | On failure |
 | --- | --- | --- |
 | before download | `nvidia-smi` shows ≥ `min_vram_gb`; `llama-server --list-devices` sees CUDA (catches driver/image mismatch) | fatal, nothing downloaded |
-| download | file exists at the **pinned commit** on the Hub; enough disk; average speed ≥ `download_min_mbps` after 90 s; all files within `download_max_s` | fatal (a download with no data for 2 minutes is restarted first) |
+| download | file exists at the **pinned commit** on the Hub; enough disk; after 90 s, the projected finish at the last minute's speed is within `download_max_s` | fatal (a download with no data for 2 minutes is restarted first) |
 | verify | size + **sha256 match the Hub's LFS hash**; GGUF magic bytes | file deleted, fatal |
 | load | `llama-server` stays alive and `/health` goes 200 within `load_timeout_s` | fatal |
 | smoke test | `/props` reports vision on; a text request and a **real image request** both return text; with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
@@ -306,11 +306,21 @@ A host's advertised `inet_down` is not what you get from Hugging Face: a test
 on a 1336 Mbps host managed 5–11 MB/s over plain HTTP. So the download has its
 own limits instead of eating the boot deadline:
 
-- `download_min_mbps` (default 25): a file averaging less after 90 s fails the
-  boot right away with "weights download too slow on this host", instead of
-  billing for 40 minutes. The autoscaler (or your next `rent-test`) can pick
-  another host. Set 0 to turn the check off.
-- `download_max_s` (default 3600): all downloads together must finish within it.
+- `download_max_s` is the time budget for all files together: 5400 s in the
+  default config (29 GB), 3600 s in the WaifuGemma4 one (17 GB) and if unset.
+  After 90 s, the worker projects the finish: the bytes still to fetch (this
+  file and the ones after it) at the speed of the last minute. Only if that
+  misses the budget does the boot fail, right away, with "weights download too
+  slow on this host", instead of billing until the budget runs out. The
+  autoscaler (or your next `rent-test`) can pick another host. The log line
+  at the start says what average speed the budget needs (about 4.7 MB/s for
+  17 GB in an hour).
+- The last minute's speed, not the average from the start, because downloads
+  often ramp up (8.5 → 19.4 → 20.6 MB/s in one rental) and Hub speeds vary
+  from host to host (8–20 MB/s seen so far).
+- `download_min_mbps` adds an optional fixed floor on that speed. It is unset
+  in the examples: fixed floors near typical Hub speeds killed downloads that
+  would have finished in time.
 - A download that receives nothing for 2 minutes is restarted.
 
 Every cold start downloads everything again. To skip that, set
@@ -319,8 +329,8 @@ disk and resumes without downloading. A stopped worker still pays Vast's
 storage rate for its disk (`template.disk_gb`), and the worker it keeps is on
 one host, which may be unavailable when you need it. With `cold_workers = 0`
 nothing is billed while idle, and each start pays for the download time
-instead. Worst case with the default 25 MB/s floor, the default config's
-29 GB takes about 20 minutes (less on fast hosts).
+instead: at the 8–20 MB/s seen so far, 17 GB takes 15–35 minutes and the
+default config's 29 GB 25–60 minutes.
 
 ## Tests
 
@@ -339,4 +349,5 @@ These run the real `boot.sh` against a fake Hub, fake GPU, fake llama-server
 and fake Vast API through every failure mode, run the real shim with the real
 vastai SDK client against a fake autoscaler and worker, and run `deploy.py`'s
 apply, read-back verification, rent-test, sweep, watch, destroy and spend
-checks against an in-memory fake of the Vast API.
+checks against an in-memory fake of the Vast API. `tests/test_fetch.py` checks
+the download budget against the speeds real rentals saw.

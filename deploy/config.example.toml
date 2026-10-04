@@ -81,12 +81,12 @@ disk_gb = 50                 # ~27 GiB of weights + image, venv and headroom (ch
 orch_repo        = "klutzydrummer/vastai-llmapi-orchestrator"
 orch_ref         = "main"    # resolved to a commit sha on apply
 deadline_s       = 2400      # boot.sh start -> ready, not counting the weight download; else ORCH_FATAL
-# The download has its own limits: a file averaging under download_min_mbps
-# (MB/s) after 90 s fails the boot early (this host is too slow; another may
-# not be), a download with no data for 2 minutes is restarted, and all
-# downloads together must finish within download_max_s.
-download_min_mbps = 25
-download_max_s    = 3600
+# The download has its own time budget, download_max_s, for all files
+# together. After 90 s the worker projects the finish from the last minute's
+# speed and fails early only if it would miss the budget (this host is too
+# slow; another may not be). A download with no data for 2 minutes is
+# restarted. Optional: download_min_mbps = N adds a fixed floor (MB/s).
+download_max_s    = 5400      # ~29 GB: needs 5.4 MB/s on average
 load_timeout_s   = 900
 pyworker_ref     = "60cfeca889f979fd73cf9e00adcd7b0ebc016fdc"
 vast_sdk_version = "1.8.3"
