@@ -1,6 +1,7 @@
 # Default: Pantheon-Reasoning 26B-A4B Q8_0 with vision, plus a Qwen3 embedding
-# model, on 40 GB+ GPUs at <= $0.60/hr. For a cheaper chat-only setup on 24 GB
-# GPUs, start from config.waifugemma4.example.toml instead.
+# model, on 40 GB+ GPUs at <= $0.60/hr. For a cheaper setup on 24 GB
+# GPUs with the same projector and embeddings, start from
+# config.waifugemma4.example.toml instead.
 # Copy to deploy/config.toml and edit. VAST_API_KEY comes from the environment.
 # Every remote reference here (model revisions, this repo's ref, the image tag)
 # is checked by `deploy.py check` and pinned to an exact commit/tag on apply,

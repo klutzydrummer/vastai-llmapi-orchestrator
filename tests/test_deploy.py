@@ -657,12 +657,14 @@ def embedding_model_goes_into_the_template_pinned():
 
 @case
 def cheaper_example_config_within_limits():
-    """the WaifuGemma4 example is chat only, on 24 GB cards, at $0.80/hr worst case"""
+    """the WaifuGemma4 example runs on 24 GB cards at $0.80/hr worst case, with the same projector and embeddings"""
     with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.waifugemma4.example.toml"), "rb") as f:
         cfg = tomllib.load(f)
     assert abs(deploy.check_limits(cfg) - 0.80) < 1e-9
-    assert "embedding" not in cfg and "EMBED_" not in deploy.docker_options(cfg, PINS)
-    assert set(cfg) == set(BASE_CFG) - {"embedding"}, set(cfg) ^ set(BASE_CFG)
+    assert cfg["embedding"] == BASE_CFG["embedding"]
+    assert (cfg["model"]["mmproj_repo"], cfg["model"]["mmproj_file"]) == \
+        (BASE_CFG["model"]["mmproj_repo"], BASE_CFG["model"]["mmproj_file"])
+    assert set(cfg) == set(BASE_CFG), set(cfg) ^ set(BASE_CFG)
 
 
 print(f"---- {len(PASSED)} passed, {len(FAILED)} failed")

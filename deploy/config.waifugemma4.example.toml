@@ -1,8 +1,8 @@
 # Cheaper alternative to config.example.toml: WaifuGemma4 26B-A4B Q4_K_M with
-# vision, chat only (no embedding model), on 24 GB GPUs at <= $0.40/hr.
+# vision, plus the same Qwen3 embedding model, on 24 GB GPUs at <= $0.40/hr.
 # Copy to deploy/config.toml and edit. VAST_API_KEY comes from the environment.
 # In shim/.env: ENDPOINT_NAME=waifugemma4, SERVED_MODEL_NAME=waifugemma4,
-# EMBED_MODEL_NAME empty.
+# EMBED_MODEL_NAME=qwen3-embedding.
 # Every remote reference here (model revisions, this repo's ref, the image tag)
 # is checked by `deploy.py check` and pinned to an exact commit/tag on apply,
 # so a worker started next month boots exactly what you tested today.
@@ -12,9 +12,20 @@ served_name     = "waifugemma4"          # model id clients see; also used by th
 repo            = "hiwaifu-research/WaifuGemma4-26b-a4b-v1-i1-GGUF"
 file            = "WaifuGemma4-26b-a4b-v1.i1-Q4_K_M.gguf"
 revision        = "main"                  # resolved to a commit sha on apply
-mmproj_repo     = "hiwaifu-research/WaifuGemma4-26b-a4b-v1-GGUF"
-mmproj_file     = "mmproj-WaifuGemma4-26b-a4b-v1-f16.gguf"
+# WaifuGemma4 is a Gemma 4 26B-A4B fine-tune; the base model's projector gives it vision.
+mmproj_repo     = "unsloth/gemma-4-26B-A4B-it-GGUF"
+mmproj_file     = "mmproj-BF16.gguf"
 mmproj_revision = "main"
+
+# Optional second model on the same GPU, served at /v1/embeddings. Remove this
+# section for text generation only.
+[embedding]
+served_name = "qwen3-embedding"           # model id for /v1/embeddings
+repo        = "Qwen/Qwen3-Embedding-0.6B-GGUF"
+file        = "Qwen3-Embedding-0.6B-Q8_0.gguf"
+revision    = "main"
+ctx         = 8192                        # longest single input, in tokens
+pooling     = "last"                      # Qwen3-Embedding uses last-token pooling
 
 [llama]
 image            = "ghcr.io/ggml-org/llama.cpp:server-cuda-b11371"   # upstream llama.cpp, pinned build (CUDA 12.8)
@@ -24,7 +35,8 @@ parallel         = 2         # slots; the Vast benchmark sends concurrent reques
 cache_type       = "q8_0"    # KV cache type for K and V
 reasoning_budget = 0         # the model card says run non-thinking
 extra_args       = ""        # extra llama-server flags, separate with ';'
-min_vram_gb      = 20        # worker refuses to start below this (checked before downloading)
+min_vram_gb      = 20        # worker refuses to start below this (checked before downloading).
+                             # Q4_K_M chat + projector + embedding weights are ~17 GiB.
 
 [endpoint]
 name               = "waifugemma4"

@@ -134,12 +134,14 @@ tests/                  fakes for the Hub, GPU, llama-server, autoscaler and wor
 You need a Vast API key. The simplest way to run everything is Docker: one
 image holds the shim, the watchdog and the deploy commands.
 
-Two example configs, pick one to copy to `deploy/config.toml`:
+Two example configs, pick one to copy to `deploy/config.toml`. Both use the
+Gemma 4 26B-A4B vision projector (`unsloth/gemma-4-26B-A4B-it-GGUF`
+`mmproj-BF16.gguf`) and serve embeddings:
 
 | File | Models | GPU | Price ceiling / budget |
 | --- | --- | --- | --- |
 | `config.example.toml` | Pantheon-Reasoning 26B-A4B Q8_0 + vision, Qwen3-Embedding-0.6B | 40 GB+ | $0.60/hr per GPU, $1.20/hr |
-| `config.waifugemma4.example.toml` | WaifuGemma4 26B-A4B Q4_K_M + vision, chat only | 24 GB | $0.40/hr per GPU, $0.80/hr |
+| `config.waifugemma4.example.toml` | WaifuGemma4 26B-A4B Q4_K_M + vision, Qwen3-Embedding-0.6B | 24 GB | $0.40/hr per GPU, $0.80/hr |
 
 Keep `ENDPOINT_NAME`, `SERVED_MODEL_NAME` and `EMBED_MODEL_NAME` in
 `shim/.env` matching the one you chose (see `shim/config.example.env`).
