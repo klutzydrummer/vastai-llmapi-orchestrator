@@ -225,9 +225,10 @@ plain systemd units (both read `shim/.env`).
 Chat Completion → Custom (OpenAI-compatible): base URL `http://<homelab>:8787/v1`,
 API key = `SHIM_API_KEY` (anything if unset), model = `served_name`.
 
-The first message after an idle period waits for a worker. Expect a few
-minutes when a cold worker resumes, longer when a fresh machine has to download
-~18 GB. Streaming shows nothing until the worker is up, then flows normally.
+The first message after an idle period waits for a worker. The example config
+keeps no stopped workers (`cold_workers = 0`), so every start downloads ~18 GB
+on a fresh machine; set `cold_workers = 1` to keep one stopped worker with the
+weights on disk (storage cost only), which resumes in a few minutes. Streaming shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
 

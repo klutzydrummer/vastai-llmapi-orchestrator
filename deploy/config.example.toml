@@ -24,7 +24,7 @@ min_vram_gb      = 20        # worker refuses to start below this (checked befor
 [endpoint]
 name               = "waifugemma4"
 max_workers        = 1       # hard cap on GPUs billed at once
-cold_workers       = 1       # stopped workers kept with weights on disk (storage cost only)
+cold_workers       = 0       # stopped workers kept with weights on disk; 0 = destroy idle workers, re-download on next start
 min_load           = 0       # 0 = allow scaling to zero running workers
 target_util        = 0.9
 cold_mult          = 1.0
