@@ -180,11 +180,22 @@ def on_disk(path):
 
 def partial_bytes(local_dir):
     """Bytes huggingface_hub has written so far: it downloads into
-    LOCAL_DIR/.cache/huggingface/download/*.incomplete and renames at the end."""
+    LOCAL_DIR/.cache/huggingface/download/*.incomplete and renames at the end.
+    hf_xet writes late and out of order, so this lags far behind what has
+    arrived; hf_progress() is the real measure, this a fallback."""
     total = 0
     for root, _, files in os.walk(os.path.join(local_dir, ".cache", "huggingface", "download")):
         total += sum(on_disk(os.path.join(root, f)) for f in files if f.endswith(".incomplete"))
     return total
+
+
+def hf_progress(path):
+    """Bytes received as hf_download.py reports them (0 until it has)."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
 
 
 def _stop(p):
@@ -278,8 +289,16 @@ def download(repo, revision, path, url, dest, size, hf):
             for f in files:
                 if f.endswith(".incomplete"):
                     os.remove(os.path.join(root, f))
-        cmd = [HF_PYTHON, HF_DOWNLOAD, repo, path, revision, local_dir]
-        rc = run_with_progress(cmd, lambda: partial_bytes(local_dir) + on_disk(dest), name, size)
+        progress = dest + ".progress"
+        if os.path.exists(progress):
+            os.remove(progress)
+        cmd = [HF_PYTHON, HF_DOWNLOAD, repo, path, revision, local_dir, progress]
+        try:
+            rc = run_with_progress(
+                cmd, lambda: max(hf_progress(progress), partial_bytes(local_dir) + on_disk(dest)), name, size)
+        finally:
+            if os.path.exists(progress):
+                os.remove(progress)
     else:
         rc = run_with_progress(direct_cmd(url, dest), lambda: on_disk(dest), name, size)
     got = os.path.getsize(dest) if os.path.exists(dest) else 0
@@ -366,6 +385,8 @@ def main():
     mm_rev = os.environ.get("MMPROJ_REVISION", "").strip() or "main"
 
     os.makedirs(MODELS_DIR, exist_ok=True)
+    log("Hugging Face token: " + ("set (HF_TOKEN)" if HF_TOKEN else
+                                  "not set; Hugging Face gives unauthenticated downloads lower rate limits"))
     paths = {"MODEL_PATH": fetch(model_repo, model_rev, model_file)}
     if mm_file:
         paths["MMPROJ_PATH"] = fetch(mm_repo, mm_rev, mm_file)
