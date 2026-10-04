@@ -83,6 +83,17 @@ def _no_space(name, value):
     return str(value)
 
 
+def download_max_s(cfg):
+    """The weight download's own time limit; the boot deadline excludes it."""
+    return int(cfg["boot"].get("download_max_s", 3600))
+
+
+def boot_limit_s(cfg):
+    """Longest a healthy worker can take from boot.sh start to ready: the boot
+    deadline plus the download's own limit."""
+    return int(cfg["boot"]["deadline_s"]) + download_max_s(cfg)
+
+
 def docker_options(cfg, pins):
     """The template's 'Docker options' string: port + env, all pinned."""
     m, l, b = cfg["model"], cfg["llama"], cfg["boot"]
@@ -103,6 +114,8 @@ def docker_options(cfg, pins):
         "LLAMA_EXTRA_ARGS": str(l.get("extra_args", "")).strip().replace(" ", ";"),
         "MIN_VRAM_GB": l["min_vram_gb"],
         "BOOT_DEADLINE": b["deadline_s"],
+        "DOWNLOAD_MIN_MBPS": b.get("download_min_mbps", 25),
+        "DOWNLOAD_MAX_S": download_max_s(cfg),
         "LOAD_TIMEOUT": b["load_timeout_s"],
         "PYWORKER_REF": b["pyworker_ref"],
         "VAST_SDK_VERSION": b["vast_sdk_version"],
@@ -339,7 +352,8 @@ def check(cfg, v=None):
     say("worker code and image")
     pins["orch_ref"] = step(f"github {b['orch_repo']}@{b['orch_ref']}", lambda: gh_resolve(b["orch_repo"], b["orch_ref"]))
     if pins["orch_ref"]:
-        for f in ("worker/onstart.sh", "worker/boot.sh", "worker/fetch_model.py", "worker/smoke_test.py",
+        for f in ("worker/onstart.sh", "worker/boot.sh", "worker/fetch_model.py", "worker/hf_download.py",
+                  "worker/smoke_test.py",
                   "worker/router.py", "worker/pyworker_worker.py"):
             def _has(f=f):
                 if not gh_raw_exists(b["orch_repo"], pins["orch_ref"], f):
@@ -371,8 +385,8 @@ def check(cfg, v=None):
 
     say("offers matching workergroup.search_params")
     if not re.search(r"\bcompute_cap\s*>=?\s*\d+", cfg["workergroup"]["search_params"]):
-        say("  warn  no compute_cap>= filter: old cards (Pascal P40, Volta V100) can be rented. "
-            "Add compute_cap>=750 (Turing and newer)")
+        say("  warn  no compute_cap>= filter: old cards (Pascal P40, Volta V100, Turing) can be rented. "
+            "Add compute_cap>=800 (Ampere and newer)")
     try:
         v = v or vast()
         offers = v.search_offers(query=cfg["workergroup"]["search_params"] + " rented=False",
@@ -932,9 +946,9 @@ def follow_instance_logs(v, iid, timeout, once=False, poll=LOGS_POLL_S):
 def cmd_logs(cfg, args):
     v = vast()
     if getattr(args, "instance_id", None) is not None:
-        # The worker gives up at its own boot deadline; allow for the image
-        # pull before boot.sh starts on top of that.
-        timeout = args.timeout or cfg["boot"]["deadline_s"] + 900
+        # The worker gives up at its own boot and download limits; allow for
+        # the image pull before boot.sh starts on top of that.
+        timeout = args.timeout or boot_limit_s(cfg) + 900
         r = follow_instance_logs(v, args.instance_id, timeout, once=args.once)
         if r in ("fatal", "gone", "timeout"):
             sys.exit(1)
@@ -1088,7 +1102,7 @@ def watch_tick(v, cfg, st, now=None):
     # 1. Workers Vast still reports as booting long past our own boot
     #    deadline: they bill (Creating/Loading/Starting are billed states) and
     #    will not become ready. Status strings we don't know are left alone.
-    limit = cfg["boot"]["deadline_s"] + cfg.get("limits", {}).get("stuck_grace_s", 600)
+    limit = boot_limit_s(cfg) + cfg.get("limits", {}).get("stuck_grace_s", 600)
     stuck = [w for w in r["worker_rows"] if str(w.get("status", "")).lower() in BOOTING
              and now - st["seen_workers"].get(str(w.get("id")), now) >= limit]
     # 2. Instances recorded as ours that are no longer workers, or test
@@ -1160,7 +1174,7 @@ def main():
     p.add_argument("--once", action="store_true",
                    help="watch: one check, then exit; logs ID: print the log once, don't wait")
     p.add_argument("--timeout", type=float, default=0,
-                   help="logs ID: seconds to wait for a marker (default: boot.deadline_s + 900)")
+                   help="logs ID: seconds to wait for a marker (default: boot.deadline_s + download_max_s + 900)")
     args = p.parse_args()
     if args.instance_id is not None and args.command != "logs":
         p.error(f"{args.command} takes no instance id")

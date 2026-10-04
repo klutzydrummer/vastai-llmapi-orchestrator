@@ -535,7 +535,10 @@ def watch_destroys_worker_stuck_booting():
     v.workers = {1: "LOADING", 2: "IDLE", 3: "ERROR"}
     t0 = time.time()
     assert not tick(v, t0)
-    limit = BASE_CFG["boot"]["deadline_s"] + BASE_CFG["limits"]["stuck_grace_s"]
+    # a worker still inside its download allowance is left alone
+    assert not tick(v, t0 + BASE_CFG["boot"]["deadline_s"] + BASE_CFG["limits"]["stuck_grace_s"] + 1)
+    limit = (BASE_CFG["boot"]["deadline_s"] + BASE_CFG["boot"]["download_max_s"]
+             + BASE_CFG["limits"]["stuck_grace_s"])
     acts = tick(v, t0 + limit + 1)
     assert [c[1] for c in v.made("destroy_instance")] == [1], (acts, v.calls)
 
@@ -666,6 +669,24 @@ def cheaper_example_config_within_limits():
     assert (cfg["model"]["mmproj_repo"], cfg["model"]["mmproj_file"]) == \
         (BASE_CFG["model"]["mmproj_repo"], BASE_CFG["model"]["mmproj_file"])
     assert set(cfg) == set(BASE_CFG), set(cfg) ^ set(BASE_CFG)
+
+
+@case
+def download_limits_reach_the_worker():
+    """[boot] download limits go into the template env; both examples require Ampere or newer"""
+    opts = deploy.docker_options(BASE_CFG, PINS)
+    b = BASE_CFG["boot"]
+    assert f"-e DOWNLOAD_MIN_MBPS={b['download_min_mbps']}" in opts, opts
+    assert f"-e DOWNLOAD_MAX_S={b['download_max_s']}" in opts, opts
+    cfg = copy.deepcopy(BASE_CFG)
+    del cfg["boot"]["download_min_mbps"], cfg["boot"]["download_max_s"]
+    assert "-e DOWNLOAD_MIN_MBPS=25" in deploy.docker_options(cfg, PINS)
+    assert deploy.boot_limit_s(cfg) == b["deadline_s"] + 3600
+    with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.waifugemma4.example.toml"), "rb") as f:
+        waifu = tomllib.load(f)
+    for c in (BASE_CFG, waifu):
+        assert "compute_cap>=800" in c["workergroup"]["search_params"], c["workergroup"]["search_params"]
+        assert c["boot"]["download_min_mbps"] == 25 and c["boot"]["download_max_s"] == 3600
 
 
 class LogVast:

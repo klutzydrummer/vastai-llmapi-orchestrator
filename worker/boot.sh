@@ -38,7 +38,12 @@ LLAMA_PARALLEL="${LLAMA_PARALLEL:-2}"
 LLAMA_CACHE_TYPE="${LLAMA_CACHE_TYPE:-q8_0}"
 LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:-}"
 MIN_VRAM_GB="${MIN_VRAM_GB:-20}"
-BOOT_DEADLINE="${BOOT_DEADLINE:-2400}"      # seconds from container start to ORCH_READY
+BOOT_DEADLINE="${BOOT_DEADLINE:-2400}"      # seconds to ORCH_READY, not counting the weight download
+DOWNLOAD_MAX_S="${DOWNLOAD_MAX_S:-3600}"    # the download's own limit (fetch_model.py enforces it)
+DOWNLOAD_METHOD="${DOWNLOAD_METHOD:-auto}"  # auto | hf | direct, see fetch_model.py
+HF_HUB_VERSION="${HF_HUB_VERSION:-2.1.1}"   # huggingface_hub[hf_xet] for Xet-stored weights
+HF_XET_VERSION="${HF_XET_VERSION:-1.6.0}"
+DOWNLOAD_PHASE="downloading and verifying weights"
 LOAD_TIMEOUT="${LOAD_TIMEOUT:-900}"         # seconds for llama-server to report healthy
 LOAD_HEARTBEAT_S="${LOAD_HEARTBEAT_S:-60}"  # a progress line this often while loading
 LIST_DEVICES_TIMEOUT="${LIST_DEVICES_TIMEOUT:-300}"
@@ -173,16 +178,32 @@ if [ "$ORCH_SKIP_PYWORKER" = "1" ] && [ "$ORCH_MANUAL_TTL" -gt 0 ] 2>/dev/null; 
 fi
 
 # ── boot deadline watchdog ────────────────────────────────────────────────────
+# BOOT_DEADLINE counts everything except the weight download, which has its
+# own limits in fetch_model.py (minimum speed, stall restart, DOWNLOAD_MAX_S):
+# a slow but steady download is not a hung boot. As a backstop for a download
+# step that hangs outright, the whole boot also gets BOOT_DEADLINE +
+# DOWNLOAD_MAX_S + 300 seconds of wall-clock time.
 (
-    sleep "$BOOT_DEADLINE"
-    if [ "$(cat "$STATE_FILE" 2>/dev/null)" = "booting" ]; then
+    counted=0; t0=$SECONDS; hard=$((BOOT_DEADLINE + DOWNLOAD_MAX_S + 300))
+    while [ "$(cat "$STATE_FILE" 2>/dev/null)" = "booting" ]; do
+        sleep 2
+        [ "$(cat "$ORCH_DIR/phase" 2>/dev/null)" = "$DOWNLOAD_PHASE" ] || counted=$((counted + 2))
+        if [ "$counted" -ge "$BOOT_DEADLINE" ]; then
+            why="not ready within ${BOOT_DEADLINE}s"
+        elif [ $((SECONDS - t0)) -ge "$hard" ]; then
+            why="not ready within ${hard}s including the download"
+        else
+            continue
+        fi
+        [ "$(cat "$STATE_FILE" 2>/dev/null)" = "booting" ] || break
         echo "fatal" > "$STATE_FILE"
-        log "$FATAL_MARK: not ready within ${BOOT_DEADLINE}s (still at: $(cat "$ORCH_DIR/phase" 2>/dev/null))"
+        log "$FATAL_MARK: $why (still at: $(cat "$ORCH_DIR/phase" 2>/dev/null))"
         schedule_fatal_cleanup
         # pkill exits 1 when nothing matched; anything higher means it couldn't run.
         pkill -f "$LLAMA_SERVER_BIN" 2>>"$MODEL_LOG"; rc=$?
         [ "$rc" -le 1 ] || log "warn: pkill failed (exit $rc); llama-server may still be running"
-    fi
+        break
+    done
 ) &
 
 # ── system packages ───────────────────────────────────────────────────────────
@@ -215,6 +236,39 @@ fi
 for b in python3 git openssl curl; do
     command -v "$b" >/dev/null 2>&1 || fatal "$b missing after install"
 done
+
+# ── huggingface_hub + hf_xet for the weights ──────────────────────────────────
+# Large files on the Hub are stored with Xet; hf_xet fetches them from Xet
+# storage directly and in parallel, much faster than HTTP range requests
+# through the CDN bridge. Pinned versions, in a venv kept on disk so a cold
+# restart reuses it. Any failure here falls back to aria2c/curl.
+setup_hf(){
+    local venv="$ORCH_DIR/hfvenv"
+    if "$venv/bin/python" -c "import sys, huggingface_hub, hf_xet; sys.exit(huggingface_hub.__version__ != '$HF_HUB_VERSION')" 2>/dev/null; then
+        HF_PYTHON="$venv/bin/python"; return 0
+    fi
+    rm -rf "$venv"
+    if ! python3 -m venv "$venv" >/dev/null 2>&1; then
+        # Debian/Ubuntu ship venv support (ensurepip) as a separate package.
+        [ "${ORCH_SKIP_APT:-0}" != "1" ] || return 1
+        apt_install python3-venv || return 1
+        rm -rf "$venv"
+        python3 -m venv "$venv" >/dev/null 2>&1 || return 1
+    fi
+    with_timeout 300 "$venv/bin/pip" install -q --disable-pip-version-check \
+        "huggingface_hub[hf_xet]==$HF_HUB_VERSION" "hf_xet==$HF_XET_VERSION" >>"$MODEL_LOG" 2>&1 || return 1
+    HF_PYTHON="$venv/bin/python"
+}
+if [ "$DOWNLOAD_METHOD" != "direct" ]; then
+    if [ -n "${HF_PYTHON:-}" ] && [ -x "$HF_PYTHON" ]; then
+        :   # provided by the environment
+    else
+        phase "installing: huggingface_hub $HF_HUB_VERSION + hf_xet $HF_XET_VERSION"
+        HF_PYTHON=""
+        setup_hf || { HF_PYTHON=""; log "warn: could not set up huggingface_hub; downloads will use aria2c/curl"; }
+    fi
+    export HF_PYTHON
+fi
 
 # ── start the PyWorker early, so the autoscaler sees this worker loading ──────
 if [ "$ORCH_SKIP_PYWORKER" != "1" ]; then
@@ -286,9 +340,10 @@ log "llama.cpp sees: $(grep -i cuda <<<"$devices" | head -3 | paste -sd ';')"
 # ── weights ───────────────────────────────────────────────────────────────────
 export PATHS_ENV="$ORCH_DIR/paths.env"
 rm -f "$PATHS_ENV"
-phase "downloading and verifying weights"
+phase "$DOWNLOAD_PHASE"
 python3 "$ORCH_DIR/fetch_model.py" 2>&1 | while IFS= read -r line; do echo "$line" | tee -a "$MODEL_LOG"; console "$line"; done
 rc=${PIPESTATUS[0]}
+[ "$rc" -ne 6 ] || fatal "weights download too slow on this host (see the [fetch] line above)"
 [ "$rc" -eq 0 ] || fatal "model fetch failed (exit $rc)"
 # shellcheck disable=SC1090
 . "$PATHS_ENV"

@@ -7,7 +7,7 @@ say(){ { [ -w /proc/1/fd/1 ] && echo "orch onstart: $*" >> /proc/1/fd/1; } 2>/de
 mkdir -p /workspace/orch
 cd /workspace/orch || exit 1
 base="${ORCH_RAW_BASE:-https://raw.githubusercontent.com/klutzydrummer/vastai-llmapi-orchestrator}/${ORCH_REF:-main}/worker"
-for f in boot.sh fetch_model.py smoke_test.py router.py pyworker_worker.py; do
+for f in boot.sh fetch_model.py hf_download.py smoke_test.py router.py pyworker_worker.py; do
     curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "$base/$f" -o "$f.new" && mv -f "$f.new" "$f" \
         || say "warn: could not fetch $f from $base; using the cached copy if there is one"
 done

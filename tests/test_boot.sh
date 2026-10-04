@@ -44,14 +44,14 @@ run_case(){
     local name="$1" expect="$2" timeout="$3"; shift 3
     local orch="$WORK/orch"
     mkdir -p "$orch"
-    cp "$REPO/worker/"{boot.sh,fetch_model.py,smoke_test.py,router.py,pyworker_worker.py} "$orch/"
+    cp "$REPO/worker/"{boot.sh,fetch_model.py,hf_download.py,smoke_test.py,router.py,pyworker_worker.py} "$orch/"
     rm -f "$orch/model.log" "$orch/model.log.prev" "$orch/console.log"
     pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; sleep 0.3
     env PATH="$WORK/bin:$PATH" ORCH_DIR="$orch" MODEL_LOG="$orch/model.log" \
         ORCH_SKIP_PYWORKER=1 ORCH_SKIP_APT=1 LLAMA_SERVER_BIN="$WORK/bin/llama-server" \
         ORCH_CONSOLE="$orch/console.log" HF_ENDPOINT="http://127.0.0.1:$HF_PORT" MODELS_DIR="$WORK/models" WORKSPACE_DIR="$WORK/workspace" \
         MODEL_REPO=test/repo MODEL_FILE=model.gguf MMPROJ_FILE=mmproj.gguf \
-        SERVED_MODEL_NAME=testmodel BOOT_DEADLINE=60 "$@" \
+        SERVED_MODEL_NAME=testmodel BOOT_DEADLINE=60 DOWNLOAD_METHOD=direct "$@" \
         setsid bash "$orch/boot.sh" > "$orch/boot.out" 2>&1 &
     local pid=$! got=""
     local deadline=$((SECONDS + timeout))
@@ -130,7 +130,40 @@ start_hub --slow 4
 rm -rf "$WORK/models"
 run_case "slow download prints progress" ready 60 DOWNLOAD_PROGRESS_S=1
 check "download progress reaches the console" grep -Eq "\[fetch\] model.gguf: [0-9.]+/[0-9.]+ GiB" "$LAST_CONSOLE"
+rm -rf "$WORK/models"
+run_case "slow download doesn't count against the boot deadline" ready 60 BOOT_DEADLINE=8 DOWNLOAD_MIN_MBPS=0
+rm -rf "$WORK/models"
+start_hub --slow 30
+run_case "host too slow for the weights fails early" fatal 30 DOWNLOAD_MIN_MBPS=10 DOWNLOAD_PROBE_S=2
+check "says the download is too slow" grep -q "ORCH_FATAL: weights download too slow on this host" "$LAST_CONSOLE"
+check "gives the measured speed" grep -q "is below DOWNLOAD_MIN_MBPS=10" "$LAST_LOG"
+rm -rf "$WORK/models"
+start_hub --stall-once
+run_case "stalled download is restarted" ready 60 DOWNLOAD_STALL_S=2
+check "says it restarted a stall" grep -q "no data for 2s, restarting" "$LAST_LOG"
+rm -rf "$WORK/models"
 start_hub
+
+# huggingface_hub path, with a stand-in for the venv python: it is called as
+# HF_PYTHON hf_download.py REPO PATH REVISION LOCAL_DIR and, like
+# huggingface_hub, writes LOCAL_DIR/.cache/huggingface/download/*.incomplete,
+# then renames it to LOCAL_DIR/PATH.
+cat > "$WORK/bin/fake-hf-python" <<'EOF2'
+#!/usr/bin/env bash
+[ -n "${FAKE_HF_FAIL:-}" ] && { echo "fake hf: failing" >&2; exit 1; }
+repo="$2" path="$3" rev="$4" dir="$5"
+tmp="$dir/.cache/huggingface/download/$path.x.incomplete"
+mkdir -p "$(dirname "$tmp")" "$(dirname "$dir/$path")"
+curl -fsS "$HF_ENDPOINT/$repo/resolve/$rev/$path" -o "$tmp" && mv -f "$tmp" "$dir/$path"
+EOF2
+chmod +x "$WORK/bin/fake-hf-python"
+run_case "weights through huggingface_hub" ready 60 DOWNLOAD_METHOD=auto HF_PYTHON="$WORK/bin/fake-hf-python"
+check "uses huggingface_hub when it is available" grep -q "model.gguf: downloading with huggingface_hub/hf_xet" "$LAST_LOG"
+rm -rf "$WORK/models"
+run_case "huggingface_hub failing falls back to direct download" ready 90 DOWNLOAD_METHOD=auto \
+    HF_PYTHON="$WORK/bin/fake-hf-python" FAKE_HF_FAIL=1
+check "says it switched" grep -q "huggingface_hub failed twice, switching to direct download" "$LAST_LOG"
+rm -rf "$WORK/models"
 NOPKILL="$WORK/nopkill"; path_without "$NOPKILL" pkill
 HOLD=1 run_case "boot deadline without pkill" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6 PATH="$NOPKILL"
 grep -q "warn: pkill failed" "$LAST_LOG" \
