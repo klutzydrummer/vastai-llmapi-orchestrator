@@ -655,5 +655,15 @@ def embedding_model_goes_into_the_template_pinned():
     assert "EMBED_" not in deploy.docker_options(cfg, PINS)
 
 
+@case
+def cheaper_example_config_within_limits():
+    """the WaifuGemma4 example is chat only, on 24 GB cards, at $0.80/hr worst case"""
+    with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.waifugemma4.example.toml"), "rb") as f:
+        cfg = tomllib.load(f)
+    assert abs(deploy.check_limits(cfg) - 0.80) < 1e-9
+    assert "embedding" not in cfg and "EMBED_" not in deploy.docker_options(cfg, PINS)
+    assert set(cfg) == set(BASE_CFG) - {"embedding"}, set(cfg) ^ set(BASE_CFG)
+
+
 print(f"---- {len(PASSED)} passed, {len(FAILED)} failed")
 sys.exit(1 if FAILED else 0)

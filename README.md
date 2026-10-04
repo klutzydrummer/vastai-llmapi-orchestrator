@@ -134,6 +134,16 @@ tests/                  fakes for the Hub, GPU, llama-server, autoscaler and wor
 You need a Vast API key. The simplest way to run everything is Docker: one
 image holds the shim, the watchdog and the deploy commands.
 
+Two example configs, pick one to copy to `deploy/config.toml`:
+
+| File | Models | GPU | Price ceiling / budget |
+| --- | --- | --- | --- |
+| `config.example.toml` | Pantheon-Reasoning 26B-A4B Q8_0 + vision, Qwen3-Embedding-0.6B | 40 GB+ | $0.60/hr per GPU, $1.20/hr |
+| `config.waifugemma4.example.toml` | WaifuGemma4 26B-A4B Q4_K_M + vision, chat only | 24 GB | $0.40/hr per GPU, $0.80/hr |
+
+Keep `ENDPOINT_NAME`, `SERVED_MODEL_NAME` and `EMBED_MODEL_NAME` in
+`shim/.env` matching the one you chose (see `shim/config.example.env`).
+
 ```bash
 cp deploy/config.example.toml deploy/config.toml   # do this before compose, or Docker
 cp shim/config.example.env shim/.env               # mounts an empty directory instead
