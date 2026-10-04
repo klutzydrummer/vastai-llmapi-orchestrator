@@ -1,24 +1,23 @@
-# Default: Pantheon-Reasoning 26B-A4B Q8_0 with vision, plus a Qwen3 embedding
-# model, on 40 GB+ GPUs at <= $0.60/hr. For a cheaper setup on 24 GB
-# GPUs with the same projector and embeddings, start from
-# config.waifugemma4.example.toml instead.
+# Cheaper alternative to config.example.toml: WaifuGemma4 26B-A4B Q4_K_M with
+# vision, plus the same Qwen3 embedding model, on 24 GB GPUs at <= $0.40/hr.
 # Copy to deploy/config.toml and edit. VAST_API_KEY comes from the environment.
+# In shim/.env: ENDPOINT_NAME=waifugemma4, SERVED_MODEL_NAME=waifugemma4,
+# EMBED_MODEL_NAME=qwen3-embedding.
 # Every remote reference here (model revisions, this repo's ref, the image tag)
 # is checked by `deploy.py check` and pinned to an exact commit/tag on apply,
 # so a worker started next month boots exactly what you tested today.
 
 [model]
-served_name     = "pantheon"              # model id clients see; also used by the benchmark
-repo            = "bartowski/Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-GGUF"
-file            = "Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0.gguf"
+served_name     = "waifugemma4"          # model id clients see; also used by the benchmark
+repo            = "hiwaifu-research/WaifuGemma4-26b-a4b-v1-i1-GGUF"
+file            = "WaifuGemma4-26b-a4b-v1.i1-Q4_K_M.gguf"
 revision        = "main"                  # resolved to a commit sha on apply
-# Pantheon is a Gemma 4 26B-A4B fine-tune; the base model's projector gives it vision.
+# WaifuGemma4 is a Gemma 4 26B-A4B fine-tune; the base model's projector gives it vision.
 mmproj_repo     = "unsloth/gemma-4-26B-A4B-it-GGUF"
 mmproj_file     = "mmproj-BF16.gguf"
 mmproj_revision = "main"
 
-# Optional second model on the same GPU, served at /v1/embeddings. It runs as
-# its own llama-server behind a small router on the worker. Remove this
+# Optional second model on the same GPU, served at /v1/embeddings. Remove this
 # section for text generation only.
 [embedding]
 served_name = "qwen3-embedding"           # model id for /v1/embeddings
@@ -34,14 +33,13 @@ image            = "ghcr.io/ggml-org/llama.cpp:server-cuda-b11371"   # upstream 
 ctx              = 32768     # total context; shared by all slots (--kv-unified)
 parallel         = 2         # slots; the Vast benchmark sends concurrent requests
 cache_type       = "q8_0"    # KV cache type for K and V
-reasoning_budget = -1        # Pantheon-Reasoning thinks before answering; 0 turns thinking off
+reasoning_budget = 0         # the model card says run non-thinking
 extra_args       = ""        # extra llama-server flags, separate with ';'
-min_vram_gb      = 40        # worker refuses to start below this (checked before downloading).
-                             # Q8_0 chat + projector + embedding weights are ~27 GiB, plus KV cache
-                             # and two CUDA contexts; 32 GB cards are too tight for 32k context.
+min_vram_gb      = 20        # worker refuses to start below this (checked before downloading).
+                             # Q4_K_M chat + projector + embedding weights are ~17 GiB.
 
 [endpoint]
-name               = "pantheon"
+name               = "waifugemma4"
 max_workers        = 1       # hard cap on GPUs billed at once
 cold_workers       = 0       # stopped workers kept with weights on disk; 0 = destroy idle workers, re-download on next start
 min_load           = 0       # 0 = allow scaling to zero running workers
@@ -51,7 +49,7 @@ inactivity_timeout = 900     # seconds idle before workers are released; verify 
 
 [workergroup]
 test_workers  = 1            # instances spun up to benchmark a new hardware type (default 3)
-gpu_ram       = 40
+gpu_ram       = 24
 # Your constraints live here: price ceiling (dph_total), VRAM floor (gpu_ram),
 # CUDA driver floor for the image (cuda_max_good), GPU generation (compute_cap),
 # download speed (inet_down). The server-cuda image (CUDA 12.8) ships compiled
@@ -59,13 +57,13 @@ gpu_ram       = 40
 # JIT-compiles on first start for the rest (Turing 7.5, A100 8.0, ...).
 # compute_cap (x100) >= 750 keeps Pascal (P40) and Volta (V100) out: no int8
 # tensor cores and slow FP16.
-search_params = "num_gpus=1 gpu_ram>=40 dph_total<=0.60 cuda_max_good>=12.8 compute_cap>=750 inet_down>=500 reliability>0.98 direct_port_count>=1"
+search_params = "num_gpus=1 gpu_ram>=22 dph_total<=0.40 cuda_max_good>=12.8 compute_cap>=750 inet_down>=500 reliability>0.98 direct_port_count>=1"
 
 [limits]
 # `check` (and so `apply`) refuses configs that could spend more than this.
 # Worst case = (endpoint.max_workers + workergroup.test_workers) x the
-# dph_total<= ceiling in search_params. Here: (1 + 1) x 0.60 = 1.20.
-max_hourly_usd  = 1.20
+# dph_total<= ceiling in search_params. Here: (1 + 1) x 0.40 = 0.80.
+max_hourly_usd  = 0.80
 max_workers_cap = 2          # endpoint.max_workers may not exceed this
 on_breach       = "pause"    # watch: pause the endpoint when the account's running $/hr exceeds max_hourly_usd ("alert" = log only)
 manual_ttl_s    = 14400      # rent-test instances stop themselves after this; sweep/watch then destroy them
@@ -73,8 +71,8 @@ stuck_grace_s   = 600        # watch: destroy a worker Vast still reports bootin
 orphan_min_age_s = 900       # watch: a former worker must be off the worker list this long before it is destroyed
 
 [template]
-name    = "llmapi-orchestrator-pantheon"
-disk_gb = 50                 # ~27 GiB of weights + image, venv and headroom (check computes it)
+name    = "llmapi-orchestrator-waifugemma4"
+disk_gb = 40
 
 [boot]
 orch_repo        = "klutzydrummer/vastai-llmapi-orchestrator"

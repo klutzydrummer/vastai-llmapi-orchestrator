@@ -5,7 +5,7 @@
 mkdir -p /workspace/orch
 cd /workspace/orch || exit 1
 base="${ORCH_RAW_BASE:-https://raw.githubusercontent.com/klutzydrummer/vastai-llmapi-orchestrator}/${ORCH_REF:-main}/worker"
-for f in boot.sh fetch_model.py smoke_test.py; do
+for f in boot.sh fetch_model.py smoke_test.py router.py pyworker_worker.py; do
     curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "$base/$f" -o "$f.new" && mv -f "$f.new" "$f"
 done
 nohup bash /workspace/orch/boot.sh > /workspace/orch/boot.out 2>&1 &

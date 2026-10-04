@@ -5,6 +5,7 @@ confirmed gone, spend limits enforced. Run: python3 tests/test_deploy.py"""
 
 import copy
 import os
+import re
 import sys
 import tempfile
 import time
@@ -23,7 +24,7 @@ deploy.say = lambda msg="": None
 with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.example.toml"), "rb") as f:
     BASE_CFG = tomllib.load(f)
 NAME = BASE_CFG["endpoint"]["name"]
-PINS = {"model_revision": "a" * 40, "orch_ref": "b" * 40, "mmproj_revision": "c" * 40}
+PINS = {"model_revision": "a" * 40, "orch_ref": "b" * 40, "mmproj_revision": "c" * 40, "embed_revision": "d" * 40}
 
 
 class Resp:
@@ -335,7 +336,7 @@ def limited(**changes):
 def example_config_within_limits():
     """the example config passes and reports its worst case"""
     worst = deploy.check_limits(BASE_CFG)
-    assert abs(worst - 0.80) < 1e-9, worst
+    assert abs(worst - 1.20) < 1e-9, worst
 
 
 @case
@@ -351,7 +352,8 @@ def missing_limits_refused():
 @case
 def price_ceiling_required():
     """search_params without a dph_total ceiling is refused"""
-    sp = BASE_CFG["workergroup"]["search_params"].replace("dph_total<=0.40", "dph_total>0.01")
+    sp = re.sub(r"dph_total<=[0-9.]+", "dph_total>0.01", BASE_CFG["workergroup"]["search_params"])
+    assert sp != BASE_CFG["workergroup"]["search_params"]
     raises(lambda: deploy.check_limits(limited(workergroup__search_params=sp)), text="price ceiling")
     assert deploy.price_ceiling("gpu_ram>=22 dph_total < 0.5 dph_total<=0.3") == 0.3
 
@@ -553,7 +555,7 @@ def watch_ignores_unknown_status():
 def watch_pauses_on_overspend():
     """account burn over max_hourly_usd pauses the endpoint, read back; unrecorded instances untouched"""
     v = deployed()
-    v.instances = [inst(1, dph=0.5), inst(9, dph=0.5)]
+    v.instances = [inst(1, dph=0.8), inst(9, dph=0.8)]
     v.workers = {1: "IDLE"}
     acts = tick(v)
     assert any("paused" in a for a in acts), acts
@@ -637,6 +639,32 @@ def missing_image_tag_suggests_newest_older_build():
         assert deploy.nearest_older_image("ghcr.io/x/y:server-cuda-b100", tries=5) is None
     finally:
         deploy._ghcr_token, deploy._ghcr_has = real
+
+
+@case
+def embedding_model_goes_into_the_template_pinned():
+    """[embedding] becomes EMBED_* template env with the pinned revision; without it, none"""
+    opts = deploy.docker_options(BASE_CFG, PINS)
+    e = BASE_CFG["embedding"]
+    for part in (f"-e EMBED_SERVED_NAME={e['served_name']}", f"-e EMBED_REPO={e['repo']}",
+                 f"-e EMBED_FILE={e['file']}", "-e EMBED_REVISION=" + "d" * 40,
+                 f"-e EMBED_CTX={e['ctx']}", f"-e EMBED_POOLING={e['pooling']}"):
+        assert part in opts, (part, opts)
+    cfg = copy.deepcopy(BASE_CFG)
+    del cfg["embedding"]
+    assert "EMBED_" not in deploy.docker_options(cfg, PINS)
+
+
+@case
+def cheaper_example_config_within_limits():
+    """the WaifuGemma4 example runs on 24 GB cards at $0.80/hr worst case, with the same projector and embeddings"""
+    with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.waifugemma4.example.toml"), "rb") as f:
+        cfg = tomllib.load(f)
+    assert abs(deploy.check_limits(cfg) - 0.80) < 1e-9
+    assert cfg["embedding"] == BASE_CFG["embedding"]
+    assert (cfg["model"]["mmproj_repo"], cfg["model"]["mmproj_file"]) == \
+        (BASE_CFG["model"]["mmproj_repo"], BASE_CFG["model"]["mmproj_file"])
+    assert set(cfg) == set(BASE_CFG), set(cfg) ^ set(BASE_CFG)
 
 
 print(f"---- {len(PASSED)} passed, {len(FAILED)} failed")

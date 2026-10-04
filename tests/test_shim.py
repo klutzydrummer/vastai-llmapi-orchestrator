@@ -40,6 +40,10 @@ class Fake:
         self.received.append(payload)
         if self.worker_status != 200:
             return web.json_response({"error": {"message": "worker exploded"}}, status=self.worker_status)
+        if request.path == "/v1/embeddings":
+            n = len(payload["input"]) if isinstance(payload["input"], list) else 1
+            return web.json_response({"object": "list", "model": payload["model"], "data": [
+                {"object": "embedding", "index": i, "embedding": [0.1, 0.2]} for i in range(n)]})
         if payload.get("stream"):
             resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
             await resp.prepare(request)
@@ -85,6 +89,7 @@ async def main():
     app.router.add_post("/route/", fake.route)
     app.router.add_post("/v1/chat/completions", fake.worker)
     app.router.add_post("/v1/completions", fake.worker)
+    app.router.add_post("/v1/embeddings", fake.worker)
     frunner = web.AppRunner(app)
     await frunner.setup()
     await web.TCPSite(frunner, "127.0.0.1", FAKE_PORT).start()
@@ -97,6 +102,12 @@ async def main():
             d = await r.json()
             assert r.status == 200 and d["data"][0]["id"] == "waifu"
         ok("/v1/models answered locally")
+
+        # no embedding model configured: /v1/embeddings is refused without waking a GPU
+        n0 = len(fake.received)
+        async with http.post(base + "/v1/embeddings", json={"input": "hi"}) as r:
+            assert r.status == 404 and len(fake.received) == n0, r.status
+        ok("/v1/embeddings refused when no embedding model is set")
 
         # non-streaming during a cold start: whitespace keepalive, valid JSON at the end
         fake.ready_at = time.time() + 2.5
@@ -162,6 +173,23 @@ async def main():
         ok("cold-start timeout reported to the client")
         fake.ready_at = 0
 
+    await runner.cleanup()
+
+    # embeddings, with an embedding model configured
+    s, runner = await make_shim(embed_model_name="qwen3-embed")
+    async with ClientSession() as http:
+        async with http.get(base + "/v1/models") as r:
+            ids = [m["id"] for m in (await r.json())["data"]]
+        assert ids == ["waifu", "qwen3-embed"], ids
+        async with http.post(base + "/v1/embeddings", json={
+                "model": "text-embedding-3-small", "input": ["a", "b"], "stream": True}) as r:
+            raw = await r.read()
+        assert r.status == 200, raw
+        d = json.loads(raw)
+        assert len(d["data"]) == 2 and d["data"][1]["embedding"] == [0.1, 0.2], d
+        assert fake.received[-1]["model"] == "qwen3-embed" and "stream" not in fake.received[-1]
+        assert s._cost({"input": "x" * 400}) == 100
+    ok("/v1/embeddings reaches the worker with the embedding model's name")
     await runner.cleanup()
 
     # auth

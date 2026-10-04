@@ -9,12 +9,15 @@ Runs against the local llama-server (default http://127.0.0.1:18000):
                text. The image is a solid red square; if the answer doesn't
                mention red that is logged as a warning, or treated as a failure
                with SMOKE_IMAGE_STRICT=1.
+  4. embedding — when EMBED_SERVED_NAME is set, /v1/embeddings must return
+               one finite, non-zero vector per input, all the same length.
 
 Exit 0 when everything passes, 1 otherwise. Output is plain log lines.
 """
 
 import base64
 import json
+import math
 import os
 import struct
 import sys
@@ -28,6 +31,7 @@ EXPECT_VISION = bool(os.environ.get("MMPROJ_PATH", "").strip())
 STRICT_IMAGE = os.environ.get("SMOKE_IMAGE_STRICT", "0") == "1"
 TIMEOUT = float(os.environ.get("SMOKE_TIMEOUT", "180"))
 MODEL = os.environ.get("SERVED_MODEL_NAME", "model")
+EMBED_MODEL = os.environ.get("EMBED_SERVED_NAME", "").strip()
 
 
 def log(msg):
@@ -118,10 +122,33 @@ def check_image():
     return True
 
 
+def check_embedding():
+    t0 = time.time()
+    inputs = ["The quick brown fox.", "A red square."]
+    status, resp = call("/v1/embeddings", {"model": EMBED_MODEL, "input": inputs})
+    try:
+        vecs = [d["embedding"] for d in sorted(resp["data"], key=lambda d: d.get("index", 0))]
+    except (KeyError, TypeError):
+        vecs = []
+    if status != 200 or len(vecs) != len(inputs):
+        log(f"FAIL: embedding request -> HTTP {status}: {resp.get('_error') or str(resp)[:300]}")
+        return False
+    dims = {len(v) for v in vecs}
+    bad = [v for v in vecs if not v or not all(isinstance(x, (int, float)) and math.isfinite(x) for x in v)
+           or not any(v)]
+    if len(dims) != 1 or bad:
+        log(f"FAIL: embedding vectors are empty, non-finite, all zero or of different lengths ({sorted(dims)})")
+        return False
+    log(f"embedding ok in {time.time() - t0:.1f}s: {len(vecs)} x {dims.pop()} dims")
+    return True
+
+
 def main():
     ok = check_props() and check_text()
     if ok and EXPECT_VISION:
         ok = check_image()
+    if ok and EMBED_MODEL:
+        ok = check_embedding()
     log("all checks passed" if ok else "checks failed")
     return 0 if ok else 1
 

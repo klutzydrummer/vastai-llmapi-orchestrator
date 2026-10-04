@@ -9,6 +9,8 @@ so clients don't time out during a cold start.
 
 Endpoints:
   POST /v1/chat/completions, /v1/completions   proxied to a worker
+  POST /v1/embeddings                          proxied to a worker (when
+                                               EMBED_MODEL_NAME is set)
   GET  /v1/models                              answered locally, never wakes a GPU
   POST /wake                                   start a worker ahead of use
   GET  /status                                 worker states from the autoscaler
@@ -38,6 +40,7 @@ class Config:
     vast_api_key: str
     endpoint_name: str
     served_model_name: str = "model"
+    embed_model_name: str = ""        # the worker's embedding model; empty = no /v1/embeddings
     host: str = "127.0.0.1"
     port: int = 8787
     shim_api_key: str = ""
@@ -59,6 +62,7 @@ class Config:
             vast_api_key=key,
             endpoint_name=name,
             served_model_name=os.environ.get("SERVED_MODEL_NAME", "model"),
+            embed_model_name=os.environ.get("EMBED_MODEL_NAME", "").strip(),
             host=os.environ.get("SHIM_HOST", "127.0.0.1"),
             port=int(os.environ.get("SHIM_PORT", "8787")),
             shim_api_key=os.environ.get("SHIM_API_KEY", "").strip(),
@@ -123,6 +127,11 @@ class Shim:
         return request.headers.get("Authorization", "") == f"Bearer {self.cfg.shim_api_key}"
 
     def _cost(self, body):
+        if "input" in body and "messages" not in body and "prompt" not in body:
+            # Embeddings: about 4 characters per token, as the worker counts it.
+            inp = body["input"]
+            items = inp if isinstance(inp, list) else [inp]
+            return max(1, int(sum(len(x) if isinstance(x, str) else len(str(x)) for x in items) / 4))
         for k in ("max_tokens", "max_completion_tokens", "n_predict"):
             v = body.get(k)
             if isinstance(v, (int, float)) and v > 0:
@@ -174,9 +183,9 @@ class Shim:
     async def models(self, request):
         if not self._authorized(request):
             return web.json_response(_error_body(401, "unauthorized"), status=401)
+        ids = [self.cfg.served_model_name] + ([self.cfg.embed_model_name] if self.cfg.embed_model_name else [])
         return web.json_response({"object": "list", "data": [{
-            "id": self.cfg.served_model_name, "object": "model",
-            "created": 0, "owned_by": "vast-serverless"}]})
+            "id": i, "object": "model", "created": 0, "owned_by": "vast-serverless"} for i in ids]})
 
     async def status(self, request):
         if not self._authorized(request):
@@ -213,7 +222,14 @@ class Shim:
         except Exception:
             return web.json_response(_error_body(400, "body must be a JSON object"), status=400)
 
-        body["model"] = self.cfg.served_model_name
+        if route == "/v1/embeddings":
+            if not self.cfg.embed_model_name:
+                return web.json_response(_error_body(404, "no embedding model configured (EMBED_MODEL_NAME)"),
+                                         status=404)
+            body["model"] = self.cfg.embed_model_name
+            body.pop("stream", None)
+        else:
+            body["model"] = self.cfg.served_model_name
         stream = bool(body.get("stream"))
         self.stats["requests"] += 1
         t0 = time.time()
@@ -304,6 +320,7 @@ def make_app(shim: Shim):
     app.router.add_post("/wake", shim.wake)
     app.router.add_post("/v1/chat/completions", lambda r: shim.generate(r, "/v1/chat/completions"))
     app.router.add_post("/v1/completions", lambda r: shim.generate(r, "/v1/completions"))
+    app.router.add_post("/v1/embeddings", lambda r: shim.generate(r, "/v1/embeddings"))
     return app
 
 

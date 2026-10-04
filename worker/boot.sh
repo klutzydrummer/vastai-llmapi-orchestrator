@@ -4,7 +4,8 @@
 # The PyWorker decides when the worker can take traffic by watching MODEL_LOG
 # for marker lines. This script owns those markers:
 #   ORCH_READY  — written only after the model downloaded, verified, loaded and
-#                 passed a real text + image request
+#                 passed a real text + image request (and an embedding
+#                 request, when an embedding model is configured)
 #   ORCH_FATAL  — written on any failure (bad GPU/driver, download, checksum,
 #                 load, smoke test, boot deadline, llama-server dying). The
 #                 PyWorker reports the error and the autoscaler drops the worker
@@ -23,6 +24,14 @@ FATAL_MARK="ORCH_FATAL"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/app/llama-server}"
 LLAMA_HOST="127.0.0.1"
 LLAMA_PORT="18000"   # pyworker's workers/openai/core.py hardcodes this port
+# With an embedding model (EMBED_FILE), two llama-servers run behind
+# worker/router.py, which takes LLAMA_PORT: chat on CHAT_PORT, embeddings on
+# EMBED_PORT. Without one, the chat llama-server listens on LLAMA_PORT itself.
+CHAT_PORT="18010"
+EMBED_PORT="18011"
+EMBED_SERVED_NAME="${EMBED_SERVED_NAME:-}"
+EMBED_CTX="${EMBED_CTX:-8192}"
+EMBED_POOLING="${EMBED_POOLING:-last}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-model}"
 LLAMA_CTX="${LLAMA_CTX:-32768}"
 LLAMA_PARALLEL="${LLAMA_PARALLEL:-2}"
@@ -104,11 +113,11 @@ schedule_fatal_cleanup(){
     ) </dev/null >/dev/null 2>&1 &
 }
 
-LLAMA_PID=""
+LLAMA_PID=""; EMBED_PID=""; ROUTER_PID=""
 fatal(){
     echo "fatal" > "$STATE_FILE"
     echo "[$(date -u '+%H:%M:%S')] [boot] $FATAL_MARK: $*" | tee -a "$MODEL_LOG" >&2
-    [ -n "$LLAMA_PID" ] && kill "$LLAMA_PID" 2>/dev/null
+    for p in $LLAMA_PID $EMBED_PID $ROUTER_PID; do kill "$p" 2>/dev/null; done
     schedule_fatal_cleanup
     exit 1
 }
@@ -186,6 +195,17 @@ failed to load model"
     export PYWORKER_REPO PYWORKER_REF
     export SDK_VERSION="$VAST_SDK_VERSION"
     export WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
+    # Our worker.py (stock llama routes + /v1/embeddings) goes at the root of
+    # the pyworker checkout; start_server.sh at PYWORKER_REF runs it in place of
+    # workers/llama/worker.py, and only clones when the checkout is missing.
+    [ -n "${EMBED_FILE:-}" ] && export EMBED_SERVED_NAME
+    pw_dir="$WORKSPACE_DIR/vast-pyworker"
+    if [ ! -d "$pw_dir/.git" ]; then
+        rm -rf "$pw_dir"
+        git clone -q "$PYWORKER_REPO" "$pw_dir" && git -C "$pw_dir" checkout -q "$PYWORKER_REF" \
+            || fatal "could not check out $PYWORKER_REPO at $PYWORKER_REF"
+    fi
+    cp -f "$ORCH_DIR/pyworker_worker.py" "$pw_dir/worker.py" || fatal "could not install pyworker worker.py"
     ss="$ORCH_DIR/start_server.sh"
     raw_base="${PYWORKER_RAW_BASE:-https://raw.githubusercontent.com/${PYWORKER_REPO#https://github.com/}}"
     raw="$raw_base/$PYWORKER_REF/start_server.sh"
@@ -235,7 +255,9 @@ export MODEL_PATH MMPROJ_PATH="${MMPROJ_PATH:-}"
 help=$("$LLAMA_SERVER_BIN" --help 2>&1)
 has(){ grep -q -- "$1" <<<"$help"; }
 
-args=(-m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$LLAMA_PORT"
+chat_port="$LLAMA_PORT"
+[ -n "${EMBED_PATH:-}" ] && chat_port="$CHAT_PORT"
+args=(-m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$chat_port"
       -a "$SERVED_MODEL_NAME" -c "$LLAMA_CTX" -np "$LLAMA_PARALLEL" -ngl 999
       -ctk "$LLAMA_CACHE_TYPE" -ctv "$LLAMA_CACHE_TYPE")
 [ -n "$MMPROJ_PATH" ] && args+=(--mmproj "$MMPROJ_PATH")
@@ -255,9 +277,30 @@ log "launching llama-server: ${args[*]}"
 "$LLAMA_SERVER_BIN" "${args[@]}" >> "$MODEL_LOG" 2>&1 &
 LLAMA_PID=$!
 
+if [ -n "${EMBED_PATH:-}" ]; then
+    # Each input must fit in one batch, so batch = context; one slot gets all
+    # of it (inputs in a request are processed one after another).
+    eargs=(-m "$EMBED_PATH" --host "$LLAMA_HOST" --port "$EMBED_PORT"
+           -a "${EMBED_SERVED_NAME:-embedding}" --embedding --pooling "$EMBED_POOLING"
+           -c "$EMBED_CTX" -b "$EMBED_CTX" -ub "$EMBED_CTX" -np 1 -ngl 999)
+    # Flash attention keeps the attention buffer small at a large batch size.
+    has "--flash-attn" && eargs+=(-fa on)
+    has "--no-webui"   && eargs+=(--no-webui)
+    log "launching embedding llama-server: ${eargs[*]}"
+    "$LLAMA_SERVER_BIN" "${eargs[@]}" >> "$MODEL_LOG" 2>&1 &
+    EMBED_PID=$!
+    ROUTER_PORT="$LLAMA_PORT" CHAT_URL="http://$LLAMA_HOST:$CHAT_PORT" \
+        EMBED_URL="http://$LLAMA_HOST:$EMBED_PORT" \
+        python3 "$ORCH_DIR/router.py" >> "$MODEL_LOG" 2>&1 &
+    ROUTER_PID=$!
+fi
+
+# With the router up, its /health is 200 only once both servers are healthy.
 t0=$SECONDS
 until curl -sf "http://$LLAMA_HOST:$LLAMA_PORT/health" >/dev/null 2>&1; do
     kill -0 "$LLAMA_PID" 2>/dev/null || fatal "llama-server exited during load (see log above)"
+    [ -z "$EMBED_PID" ] || kill -0 "$EMBED_PID" 2>/dev/null || fatal "embedding llama-server exited during load (see log above)"
+    [ -z "$ROUTER_PID" ] || kill -0 "$ROUTER_PID" 2>/dev/null || fatal "router exited during load (see log above)"
     [ $((SECONDS - t0)) -lt "$LOAD_TIMEOUT" ] || fatal "llama-server not healthy after ${LOAD_TIMEOUT}s"
     [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] && fatal "boot deadline hit during load"
     sleep 3
@@ -266,6 +309,7 @@ log "llama-server healthy after $((SECONDS - t0))s"
 
 # ── prove it works ────────────────────────────────────────────────────────────
 LLAMA_URL="http://$LLAMA_HOST:$LLAMA_PORT" SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
+    EMBED_SERVED_NAME="$([ -n "${EMBED_PATH:-}" ] && echo "${EMBED_SERVED_NAME:-embedding}")" \
     python3 "$ORCH_DIR/smoke_test.py" 2>&1 | tee -a "$MODEL_LOG"
 [ "${PIPESTATUS[0]}" -eq 0 ] || fatal "smoke test failed"
 
@@ -274,8 +318,16 @@ echo "ready" > "$STATE_FILE"
 echo "[$(date -u '+%H:%M:%S')] [boot] $READY_MARK model=$SERVED_MODEL_NAME" >> "$MODEL_LOG"
 log "worker ready"
 
-# ── stay up with llama-server; report if it dies ──────────────────────────────
-wait "$LLAMA_PID"
+# ── stay up with the servers; report the first one that dies ─────────────────
+wait -n $LLAMA_PID $EMBED_PID $ROUTER_PID
 rc=$?
-LLAMA_PID=""
-fatal "llama-server exited with code $rc"
+for p in $LLAMA_PID $EMBED_PID $ROUTER_PID; do
+    kill -0 "$p" 2>/dev/null && continue
+    case "$p" in
+        "$LLAMA_PID") what="llama-server" ;;
+        "$EMBED_PID") what="embedding llama-server" ;;
+        *) what="router" ;;
+    esac
+    break
+done
+fatal "${what:-llama-server} exited with code $rc"

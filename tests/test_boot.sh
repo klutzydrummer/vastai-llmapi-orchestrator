@@ -10,14 +10,14 @@ HF_PORT=18999
 VAST_PORT=18998
 PASS=0; FAIL=0
 HF_PID=""; VAST_PID=""
-trap '[ -n "$HF_PID" ] && kill "$HF_PID" 2>/dev/null; [ -n "$VAST_PID" ] && kill "$VAST_PID" 2>/dev/null; pkill -f fake_llama_server.py 2>/dev/null; rm -rf "$WORK"' EXIT
+trap '[ -n "$HF_PID" ] && kill "$HF_PID" 2>/dev/null; [ -n "$VAST_PID" ] && kill "$VAST_PID" 2>/dev/null; pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/orch/router.py" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # fake weights: GGUF magic + filler
 mkdir -p "$WORK/hub" "$WORK/bin"
 python3 - "$WORK/hub" <<'EOF'
 import os, sys
 d = sys.argv[1]
-for name, n in (("model.gguf", 3_000_000), ("mmproj.gguf", 400_000)):
+for name, n in (("model.gguf", 3_000_000), ("mmproj.gguf", 400_000), ("embed.gguf", 200_000)):
     with open(os.path.join(d, name), "wb") as f:
         f.write(b"GGUF" + os.urandom(n))
 EOF
@@ -44,7 +44,7 @@ run_case(){
     local name="$1" expect="$2" timeout="$3"; shift 3
     local orch="$WORK/orch"
     mkdir -p "$orch"
-    cp "$REPO/worker/"{boot.sh,fetch_model.py,smoke_test.py} "$orch/"
+    cp "$REPO/worker/"{boot.sh,fetch_model.py,smoke_test.py,router.py,pyworker_worker.py} "$orch/"
     rm -f "$orch/model.log" "$orch/model.log.prev"
     pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; sleep 0.3
     env PATH="$WORK/bin:$PATH" ORCH_DIR="$orch" MODEL_LOG="$orch/model.log" \
@@ -117,6 +117,23 @@ grep -q "warn: pkill failed" "$LAST_LOG" \
     && { echo "PASS  a pkill that can't run is logged"; PASS=$((PASS+1)); } \
     || { echo "FAIL  pkill failure not logged"; FAIL=$((FAIL+1)); }
 run_case "llama-server dies after ready" ready_then_fatal 40 FAKE_LLAMA_MODE=die_after_ready
+
+# ── chat + embedding model behind the local router ───────────────────────────
+EMB=(EMBED_REPO=test/repo EMBED_FILE=embed.gguf EMBED_SERVED_NAME=testembed)
+run_case "chat + embedding servers behind the router" ready 60 "${EMB[@]}"
+grep -q -- "--embedding --pooling last" "$LAST_LOG" && grep -q "embedding ok" "$LAST_LOG" \
+    && grep -q "text ok" "$LAST_LOG" && grep -q "image ok" "$LAST_LOG" \
+    && echo "PASS  chat, image and embedding requests all went through the router" && PASS=$((PASS+1)) \
+    || { echo "FAIL  router path incomplete"; FAIL=$((FAIL+1)); sed 's/^/      /' "$LAST_LOG" | tail -15; }
+run_case "embedding server returns zero vectors" fatal 30 "${EMB[@]}" FAKE_EMBED_MODE=zero
+run_case "embedding server crashes during load" fatal 30 "${EMB[@]}" FAKE_EMBED_MODE=crash
+grep -q "embedding llama-server exited during load" "$LAST_LOG" \
+    && { echo "PASS  embedding crash named in the fatal line"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  embedding crash not named"; FAIL=$((FAIL+1)); }
+run_case "chat server dies after ready, embedding keeps running" ready_then_fatal 40 "${EMB[@]}" FAKE_LLAMA_MODE=die_after_ready
+grep -q "ORCH_FATAL: llama-server exited" "$LAST_LOG" \
+    && { echo "PASS  the dead chat server is named"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  dead server not named"; FAIL=$((FAIL+1)); }
 
 rm -rf "$WORK/models"
 start_hub --corrupt model.gguf
