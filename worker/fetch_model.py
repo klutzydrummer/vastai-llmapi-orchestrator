@@ -24,12 +24,18 @@ Configuration (environment):
   DOWNLOAD_METHOD       auto (default): huggingface_hub + hf_xet when HF_PYTHON
                         is set, else aria2c/curl; hf; direct (aria2c/curl only)
   HF_PYTHON             python with huggingface_hub[hf_xet] (boot.sh sets it)
-  DOWNLOAD_MIN_MBPS     give up when a file's average speed after
-                        DOWNLOAD_PROBE_S (default 90) seconds is below this many
-                        MB/s, default 25; 0 = no minimum. Another host may be faster.
+  DOWNLOAD_MAX_S        the time budget for all downloads together, default 3600.
+                        After a warm-up of DOWNLOAD_PROBE_S (default 90) seconds
+                        per attempt, give up as soon as the bytes still to fetch
+                        (this file and the ones after it), at the speed of the
+                        last minute, would finish past it: this host is too slow,
+                        another may not be. Speed varies a lot (8-20 MB/s from
+                        the Hub on the same kind of host) and often ramps up, so
+                        the projection uses recent speed, not the average.
+  DOWNLOAD_MIN_MBPS     optional extra floor in MB/s on that recent speed;
+                        default 0 (none)
   DOWNLOAD_STALL_S      restart an attempt that has received nothing for this
                         long, default 120
-  DOWNLOAD_MAX_S        give up when all downloads together take longer, default 3600
 
 Exit status: 0 ok, 2 bad configuration / file not found on the Hub,
 3 not enough disk, 4 download failed, 5 verification failed, 6 too slow.
@@ -57,8 +63,10 @@ PROGRESS_S = max(1.0, float(os.environ.get("DOWNLOAD_PROGRESS_S", "30")))
 METHOD = os.environ.get("DOWNLOAD_METHOD", "auto").strip() or "auto"
 HF_PYTHON = os.environ.get("HF_PYTHON", "").strip()
 HF_DOWNLOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_download.py")
-MIN_RATE = float(os.environ.get("DOWNLOAD_MIN_MBPS", "25")) * 1e6
+MIN_RATE = float(os.environ.get("DOWNLOAD_MIN_MBPS", "0") or 0) * 1e6
 PROBE_S = float(os.environ.get("DOWNLOAD_PROBE_S", "90"))
+RECENT_S = 60          # the window "recent speed" is measured over
+LATER = [0]            # bytes of the files still to fetch after the current one
 STALL_S = float(os.environ.get("DOWNLOAD_STALL_S", "120"))
 MAX_S = float(os.environ.get("DOWNLOAD_MAX_S", "3600"))
 STARTED = time.time()
@@ -207,13 +215,30 @@ def _stop(p):
         p.wait()
 
 
+def too_slow(spent, left, rate, max_s=None, min_rate=None):
+    """Why this download can't make its budget, or None if it can.
+    spent: seconds all downloads have taken so far; left: bytes still to fetch
+    (this file and those after it); rate: recent speed in bytes/s."""
+    max_s = MAX_S if max_s is None else max_s
+    min_rate = MIN_RATE if min_rate is None else min_rate
+    if min_rate > 0 and rate < min_rate:
+        return f"{rate / 1e6:.1f} MB/s over the last minute is below DOWNLOAD_MIN_MBPS={min_rate / 1e6:g}"
+    finish = spent + left / rate if rate > 0 else float("inf")
+    if finish <= max_s:
+        return None
+    eta = f"~{left / rate / 60:.0f} min more" if rate > 0 else "forever"
+    return (f"at {rate / 1e6:.1f} MB/s (last minute) the {left / 1024**3:.1f} GiB still to fetch would take "
+            f"{eta}, past DOWNLOAD_MAX_S={max_s:.0f}s ({spent / 60:.0f} min spent so far)")
+
+
 def run_with_progress(cmd, measure, name, size):
     """Run a downloader. Logs progress every PROGRESS_S seconds, restarts an
-    attempt that has stalled, and gives up early on a host too slow to finish
-    in reasonable time instead of downloading until the boot deadline."""
+    attempt that has stalled, and gives up early when, at the recent speed,
+    the downloads can't finish within DOWNLOAD_MAX_S."""
     p = subprocess.Popen(cmd)
     t0 = last_t = moved_t = time.time()
-    start_b = last_b = moved_b = measure()
+    last_b = moved_b = measure()
+    window = [(t0, last_b)]          # (time, bytes) samples over the last RECENT_S
     tick = min(5.0, PROGRESS_S)
     while True:
         try:
@@ -221,24 +246,26 @@ def run_with_progress(cmd, measure, name, size):
         except subprocess.TimeoutExpired:
             pass
         now, got = time.time(), measure()
-        avg = (got - start_b) / max(now - t0, 1e-6)
+        window.append((now, got))
+        while len(window) > 2 and now - window[1][0] >= RECENT_S:
+            window.pop(0)
+        rate = (got - window[0][1]) / max(now - window[0][0], 1e-6)
         if got > moved_b:
             moved_t, moved_b = now, got
         if now - last_t >= PROGRESS_S:
-            rate = (got - last_b) / max(now - last_t, 1e-6)
-            left = f", ~{(size - got) / avg / 60:.0f} min left" if avg > 0 else ""
+            step = (got - last_b) / max(now - last_t, 1e-6)
+            left = f", ~{(size - got) / rate / 60:.0f} min left" if rate > 0 else ""
             log(f"{name}: {got / 1024**3:.2f}/{size / 1024**3:.2f} GiB "
-                f"({100 * got / max(size, 1):.0f}%), {rate / 1e6:.1f} MB/s{left}")
+                f"({100 * got / max(size, 1):.0f}%), {step / 1e6:.1f} MB/s{left}")
             last_t, last_b = now, got
         if now - moved_t >= STALL_S:
             _stop(p)
             raise FetchError(f"{name}: no data for {STALL_S:.0f}s, restarting the download", EXIT_DOWNLOAD)
-        if MIN_RATE > 0 and now - t0 >= PROBE_S and avg < MIN_RATE:
-            _stop(p)
-            raise TooSlow(f"{name}: {avg / 1e6:.1f} MB/s average over {now - t0:.0f}s is below "
-                          f"DOWNLOAD_MIN_MBPS={MIN_RATE / 1e6:g}; the remaining "
-                          f"{(size - got) / 1024**3:.1f} GiB would take ~{(size - got) / max(avg, 1) / 60:.0f} min "
-                          f"on this host")
+        if now - t0 >= PROBE_S:
+            why = too_slow(now - STARTED, max(size - got, 0) + LATER[0], rate)
+            if why:
+                _stop(p)
+                raise TooSlow(f"{name}: {why}")
         if now - STARTED >= MAX_S:
             _stop(p)
             raise TooSlow(f"downloads have taken over DOWNLOAD_MAX_S={MAX_S:.0f}s")
@@ -306,9 +333,13 @@ def download(repo, revision, path, url, dest, size, hf):
         raise FetchError(f"download of {name} incomplete (exit {rc}, {got}/{size} bytes)", EXIT_DOWNLOAD)
 
 
-def fetch(repo, revision, path):
-    size, sha = hub_file_info(repo, revision, path)
-    dest = os.path.join(MODELS_DIR, repo.replace("/", "__"), path)
+def dest_for(repo, path):
+    return os.path.join(MODELS_DIR, repo.replace("/", "__"), path)
+
+
+def fetch(repo, revision, path, info=None):
+    size, sha = info or hub_file_info(repo, revision, path)
+    dest = dest_for(repo, path)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     gb = size / 1024**3
     log(f"{repo}@{revision[:12]}:{path} — {gb:.2f} GiB, sha256 {sha[:12]}…")
@@ -387,16 +418,29 @@ def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
     log("Hugging Face token: " + ("set (HF_TOKEN)" if HF_TOKEN else
                                   "not set; Hugging Face gives unauthenticated downloads lower rate limits"))
-    paths = {"MODEL_PATH": fetch(model_repo, model_rev, model_file)}
+    jobs = [("MODEL_PATH", model_repo, model_rev, model_file)]
     if mm_file:
-        paths["MMPROJ_PATH"] = fetch(mm_repo, mm_rev, mm_file)
+        jobs.append(("MMPROJ_PATH", mm_repo, mm_rev, mm_file))
     embed_file = os.environ.get("EMBED_FILE", "").strip()
     if embed_file:
         embed_repo = os.environ.get("EMBED_REPO", "").strip()
         if not embed_repo:
             raise FetchError("EMBED_FILE is set but EMBED_REPO is not", EXIT_CONFIG)
         embed_rev = os.environ.get("EMBED_REVISION", "").strip() or "main"
-        paths["EMBED_PATH"] = fetch(embed_repo, embed_rev, embed_file)
+        jobs.append(("EMBED_PATH", embed_repo, embed_rev, embed_file))
+
+    # Every file's size up front, so the time budget check knows how much is
+    # still to come after the file being downloaded.
+    infos = [hub_file_info(repo, rev, path) for _, repo, rev, path in jobs]
+    todo = [0 if marker_ok(dest_for(repo, path), *info) else info[0]
+            for (_, repo, _, path), info in zip(jobs, infos)]
+    if sum(todo):
+        log(f"{sum(todo) / 1024**3:.1f} GiB to download, budget DOWNLOAD_MAX_S={MAX_S:.0f}s "
+            f"(needs {sum(todo) / MAX_S / 1e6:.1f} MB/s on average)")
+    paths = {}
+    for i, ((key, repo, rev, path), info) in enumerate(zip(jobs, infos)):
+        LATER[0] = sum(todo[i + 1:])
+        paths[key] = fetch(repo, rev, path, info)
 
     os.makedirs(os.path.dirname(PATHS_ENV), exist_ok=True)
     with open(PATHS_ENV, "w") as f:

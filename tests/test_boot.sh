@@ -131,12 +131,13 @@ rm -rf "$WORK/models"
 run_case "slow download prints progress" ready 60 DOWNLOAD_PROGRESS_S=1
 check "download progress reaches the console" grep -Eq "\[fetch\] model.gguf: [0-9.]+/[0-9.]+ GiB" "$LAST_CONSOLE"
 rm -rf "$WORK/models"
-run_case "slow download doesn't count against the boot deadline" ready 60 BOOT_DEADLINE=8 DOWNLOAD_MIN_MBPS=0
+run_case "slow download doesn't count against the boot deadline" ready 60 BOOT_DEADLINE=8
 rm -rf "$WORK/models"
 start_hub --slow 30
-run_case "host too slow for the weights fails early" fatal 30 DOWNLOAD_MIN_MBPS=10 DOWNLOAD_PROBE_S=2
+run_case "host too slow for the download budget fails early" fatal 30 DOWNLOAD_MAX_S=10 DOWNLOAD_PROBE_S=2
 check "says the download is too slow" grep -q "ORCH_FATAL: weights download too slow on this host" "$LAST_CONSOLE"
-check "gives the measured speed" grep -q "is below DOWNLOAD_MIN_MBPS=10" "$LAST_LOG"
+check "says it would miss the budget" grep -q "past DOWNLOAD_MAX_S=10s" "$LAST_LOG"
+check "states the budget and the speed it needs" grep -q "budget DOWNLOAD_MAX_S=10s (needs" "$LAST_LOG"
 rm -rf "$WORK/models"
 start_hub --stall-once
 run_case "stalled download is restarted" ready 60 DOWNLOAD_STALL_S=2
@@ -170,7 +171,7 @@ check "uses huggingface_hub when it is available" grep -q "model.gguf: downloadi
 check "says whether a Hugging Face token is set" grep -q "Hugging Face token: not set" "$LAST_LOG"
 rm -rf "$WORK/models"
 LATE=(DOWNLOAD_METHOD=auto HF_PYTHON="$WORK/bin/fake-hf-python" FAKE_HF_LATE=5
-      DOWNLOAD_MIN_MBPS=1 DOWNLOAD_PROBE_S=2 DOWNLOAD_STALL_S=3 DOWNLOAD_PROGRESS_S=1)
+      DOWNLOAD_MAX_S=30 DOWNLOAD_PROBE_S=2 DOWNLOAD_STALL_S=3 DOWNLOAD_PROGRESS_S=1)
 run_case "hf_xet writing late is not mistaken for slow or stalled" ready 60 "${LATE[@]}"
 check "progress counts bytes received, not bytes on disk" grep -Eq "\[fetch\] model.gguf: 0\.0[1-9]" "$LAST_LOG"
 rm -rf "$WORK/models"

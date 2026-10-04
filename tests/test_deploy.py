@@ -673,20 +673,23 @@ def cheaper_example_config_within_limits():
 
 @case
 def download_limits_reach_the_worker():
-    """[boot] download limits go into the template env; both examples require Ampere or newer"""
+    """[boot] download budget goes into the template env; no fixed speed floor unless set; Ampere or newer"""
     opts = deploy.docker_options(BASE_CFG, PINS)
-    b = BASE_CFG["boot"]
-    assert f"-e DOWNLOAD_MIN_MBPS={b['download_min_mbps']}" in opts, opts
-    assert f"-e DOWNLOAD_MAX_S={b['download_max_s']}" in opts, opts
+    assert f"-e DOWNLOAD_MAX_S={BASE_CFG['boot']['download_max_s']}" in opts, opts
+    assert "DOWNLOAD_MIN_MBPS" not in opts, opts
     cfg = copy.deepcopy(BASE_CFG)
-    del cfg["boot"]["download_min_mbps"], cfg["boot"]["download_max_s"]
-    assert "-e DOWNLOAD_MIN_MBPS=25" in deploy.docker_options(cfg, PINS)
-    assert deploy.boot_limit_s(cfg) == b["deadline_s"] + 3600
+    cfg["boot"]["download_min_mbps"] = 3
+    assert "-e DOWNLOAD_MIN_MBPS=3" in deploy.docker_options(cfg, PINS)
+    del cfg["boot"]["download_max_s"]
+    assert deploy.boot_limit_s(cfg) == cfg["boot"]["deadline_s"] + 3600
     with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.waifugemma4.example.toml"), "rb") as f:
         waifu = tomllib.load(f)
     for c in (BASE_CFG, waifu):
         assert "compute_cap>=800" in c["workergroup"]["search_params"], c["workergroup"]["search_params"]
-        assert c["boot"]["download_min_mbps"] == 25 and c["boot"]["download_max_s"] == 3600
+        assert "download_min_mbps" not in c["boot"], c["boot"]
+    # each budget leaves room for the slowest Hub speed seen so far (~6 MB/s)
+    # on that config's weights (about 29 and 17 GB)
+    assert BASE_CFG["boot"]["download_max_s"] * 6e6 > 29e9 and waifu["boot"]["download_max_s"] * 6e6 > 17e9
 
 
 class LogVast:

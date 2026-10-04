@@ -114,7 +114,7 @@ def docker_options(cfg, pins):
         "LLAMA_EXTRA_ARGS": str(l.get("extra_args", "")).strip().replace(" ", ";"),
         "MIN_VRAM_GB": l["min_vram_gb"],
         "BOOT_DEADLINE": b["deadline_s"],
-        "DOWNLOAD_MIN_MBPS": b.get("download_min_mbps", 25),
+        "DOWNLOAD_MIN_MBPS": b.get("download_min_mbps"),   # optional floor; unset = none
         "DOWNLOAD_MAX_S": download_max_s(cfg),
         "LOAD_TIMEOUT": b["load_timeout_s"],
         "PYWORKER_REF": b["pyworker_ref"],
