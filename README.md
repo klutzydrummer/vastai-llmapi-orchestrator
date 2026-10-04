@@ -200,15 +200,21 @@ docker compose logs -f watch               # "[watch]" lines show every action i
 Both containers stay up with `restart: unless-stopped`. Stopping the watchdog
 container mid-check is safe: its state lock is an flock the kernel drops.
 
-On NixOS, the same image works with `virtualisation.oci-containers`
-(`docker build -t vastai-llmapi-orchestrator .` first):
+On NixOS, the same image works with `virtualisation.oci-containers`. The image
+is only built locally, never pulled, so build it with the same engine as
+`virtualisation.oci-containers.backend` (`docker build -t
+vastai-llmapi-orchestrator .`, or `podman build` for the podman default) before
+the first `nixos-rebuild switch`, and again after each `git pull`:
 
 ```nix
 virtualisation.oci-containers.containers = let
   orch = cmd: {
     image = "vastai-llmapi-orchestrator:latest";
     cmd = cmd;
-    environmentFiles = [ /etc/llmapi-shim.env ];
+    # Quoted strings, not Nix paths: an unquoted /etc/... path is copied into
+    # the world-readable /nix/store (or fails in pure flake evaluation), and
+    # this file holds VAST_API_KEY.
+    environmentFiles = [ "/etc/llmapi-shim.env" ];
     volumes = [ "orch-state:/data" "/etc/orch/config.toml:/config/config.toml:ro" ];
   };
 in {
@@ -244,8 +250,15 @@ states.
 ## Tests
 
 ```bash
-tests/run_all.sh
+docker compose run --rm test   # in the test image, with everything it needs
+tests/run_all.sh               # or directly on the host
 ```
+
+On the host the suite needs bash, python3 with `shim/requirements.txt`
+installed, and curl, git, openssl, pkill (procps), setsid (util-linux) and
+timeout (coreutils). `run_all.sh` checks for them and stops with a list of
+what's missing, and gives each suite a time limit so it fails instead of
+hanging. Nothing touches Vast.
 
 These run the real `boot.sh` against a fake Hub, fake GPU, fake llama-server
 and fake Vast API through every failure mode, run the real shim with the real

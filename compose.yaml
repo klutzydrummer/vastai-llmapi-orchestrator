@@ -1,5 +1,6 @@
 # docker compose up -d --build        shim + watchdog, restarted automatically
 # docker compose run --rm deploy check|apply|status|sweep|destroy|...
+# docker compose run --rm test       offline test suite, touches nothing on Vast
 #
 # Before the first run: cp deploy/config.example.toml deploy/config.toml and
 # cp shim/config.example.env shim/.env, then fill both in.
@@ -35,6 +36,14 @@ services:
     <<: *orch
     profiles: ["cli"]
     command: ["status"]
+
+  # Offline tests: docker compose run --rm test
+  test:
+    build:
+      context: .
+      target: test
+    image: vastai-llmapi-orchestrator:test
+    profiles: ["cli"]
 
 volumes:
   orch-state:

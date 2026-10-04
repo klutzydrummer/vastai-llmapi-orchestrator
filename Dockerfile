@@ -1,6 +1,6 @@
 # One image for everything that runs at home: the shim, the watchdog and the
 # deploy commands. See compose.yaml for how they're run.
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 # git: deploy.py resolves branch/tag refs with `git ls-remote`.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
@@ -27,3 +27,18 @@ ENV ORCH_STATE_PATH=/data/state.json \
 EXPOSE 8787
 ENTRYPOINT ["orch"]
 CMD ["shim"]
+
+# The offline test suite plus the tools it needs (docker compose run --rm test).
+FROM base AS test
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl openssl procps util-linux \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/ tests/
+# py_compile writes __pycache__ next to the sources.
+RUN chown -R orch /app
+USER orch
+ENTRYPOINT []
+CMD ["bash", "tests/run_all.sh"]
+
+# Last stage = what `docker build .` and compose build by default.
+FROM base AS runtime
