@@ -6,6 +6,9 @@
   deploy.py apply     check, then create/update template, endpoint, workergroup
   deploy.py status    endpoint, workergroups and workers
   deploy.py logs      recent endpoint logs from the autoscaler
+  deploy.py logs ID   follow one instance's boot through `vastai logs` until
+                      it prints ORCH_READY (exit 0) or ORCH_FATAL (exit 1);
+                      --once prints what is there now and returns
   deploy.py pause     stop the endpoint (workers go inactive: storage cost only)
   deploy.py resume    reactivate it
   deploy.py sweep     destroy orphans: instances recorded as ours (former
@@ -507,7 +510,15 @@ def _wait_for(fn, what):
 def confirm(prompt, yes):
     if yes:
         return True
-    return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    # `docker compose run` without -it, cron, CI: no one can answer, so stop
+    # before doing anything rather than crash on the prompt.
+    no_tty = SystemExit(f"{prompt}\nno terminal to confirm on; pass --yes to go ahead without asking")
+    if not sys.stdin.isatty():
+        raise no_tty
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        raise no_tty from None
 
 
 # ── verify after write ───────────────────────────────────────────────────────
@@ -869,8 +880,65 @@ def cmd_sweep(cfg, args):
         save_state(st)
 
 
+LOGS_POLL_S = 20
+GONE = {"exited", "stopped", "offline", "destroyed"}
+
+
+def _log_text(out):
+    """vastai logs gives the log text, or a dict when Vast has no log to hand back."""
+    if isinstance(out, str):
+        return out
+    if isinstance(out, dict):
+        return str(out.get("msg") or out.get("error") or json.dumps(out))
+    return str(out)
+
+
+def follow_instance_logs(v, iid, timeout, once=False, poll=LOGS_POLL_S):
+    """Print an instance's container log as it grows until a boot marker shows
+    up. Returns "ready", "fatal", "gone", "timeout" or "once"."""
+    seen, t0, note = set(), time.time(), None
+    while True:
+        try:
+            text = _log_text(v.logs(iid, tail="1000"))
+        except Exception as e:   # a log request that isn't ready yet is normal early on
+            text, msg = "", f"no log from Vast yet ({type(e).__name__}: {str(e)[:200]})"
+            if msg != note:
+                say(msg)
+                note = msg
+        marker = None
+        for line in text.splitlines():
+            if line in seen:
+                continue
+            seen.add(line)
+            say(line)
+            if "ORCH_FATAL:" in line:
+                marker = marker or "fatal"
+            elif "ORCH_READY model=" in line:
+                marker = marker or "ready"
+        if marker or once:
+            return marker or "once"
+        inst = v.show_instance(iid)
+        status = str((inst or {}).get("actual_status") or "").lower()
+        if not inst or status in GONE:
+            say(f"instance {iid} is {status or 'gone'} and printed no ORCH_READY or ORCH_FATAL")
+            return "gone"
+        if time.time() - t0 >= timeout:
+            say(f"no ORCH_READY or ORCH_FATAL from instance {iid} within {timeout:.0f}s "
+                f"(status {status or 'unknown'}); the full boot log is /workspace/orch/model.log on it")
+            return "timeout"
+        time.sleep(poll)
+
+
 def cmd_logs(cfg, args):
     v = vast()
+    if getattr(args, "instance_id", None) is not None:
+        # The worker gives up at its own boot deadline; allow for the image
+        # pull before boot.sh starts on top of that.
+        timeout = args.timeout or cfg["boot"]["deadline_s"] + 900
+        r = follow_instance_logs(v, args.instance_id, timeout, once=args.once)
+        if r in ("fatal", "gone", "timeout"):
+            sys.exit(1)
+        return
     ep = find_endpoint(v, cfg["endpoint"]["name"], load_state(), allow_state_id=True)
     if not ep:
         raise SystemExit("endpoint not found")
@@ -1005,7 +1073,7 @@ def cmd_rent_test(cfg, args):
         inst = _wait_for(lambda: next((i for i in _rows(v.show_instances(), "show_instances")
                                        if i.get("id") == iid), None), f"instance {iid}")
         say(f"  {_describe(inst)}")
-    say("follow the boot with: vastai logs " + str(iid))
+    say(f"follow the boot with: deploy.py logs {iid}")
 
 
 # ── watch ────────────────────────────────────────────────────────────────────
@@ -1078,6 +1146,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["check", "apply", "status", "logs", "pause", "resume", "sweep",
                                        "destroy", "rent-test", "watch"])
+    p.add_argument("instance_id", nargs="?", type=int,
+                   help="logs: an instance id to follow until its boot prints ORCH_READY or ORCH_FATAL")
     p.add_argument("--config", default=os.environ.get("ORCH_CONFIG") or os.path.join(HERE, "config.toml"))
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -1087,8 +1157,13 @@ def main():
     p.add_argument("--destroy", type=int, nargs="+", default=[], metavar="ID",
                    help="sweep: also destroy these instance ids (e.g. ones listed as unrecorded)")
     p.add_argument("--interval", type=float, default=60, help="watch: seconds between checks")
-    p.add_argument("--once", action="store_true", help="watch: one check, then exit")
+    p.add_argument("--once", action="store_true",
+                   help="watch: one check, then exit; logs ID: print the log once, don't wait")
+    p.add_argument("--timeout", type=float, default=0,
+                   help="logs ID: seconds to wait for a marker (default: boot.deadline_s + 900)")
     args = p.parse_args()
+    if args.instance_id is not None and args.command != "logs":
+        p.error(f"{args.command} takes no instance id")
     cfg = load_config(args.config)
     try:
         {"check": cmd_check, "apply": cmd_apply, "status": cmd_status, "logs": cmd_logs,

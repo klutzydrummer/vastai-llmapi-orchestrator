@@ -40,6 +40,8 @@ LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:-}"
 MIN_VRAM_GB="${MIN_VRAM_GB:-20}"
 BOOT_DEADLINE="${BOOT_DEADLINE:-2400}"      # seconds from container start to ORCH_READY
 LOAD_TIMEOUT="${LOAD_TIMEOUT:-900}"         # seconds for llama-server to report healthy
+LOAD_HEARTBEAT_S="${LOAD_HEARTBEAT_S:-60}"  # a progress line this often while loading
+LIST_DEVICES_TIMEOUT="${LIST_DEVICES_TIMEOUT:-300}"
 
 PYWORKER_REPO="${PYWORKER_REPO:-https://github.com/vast-ai/pyworker}"
 PYWORKER_REF="${PYWORKER_REF:-60cfeca889f979fd73cf9e00adcd7b0ebc016fdc}"
@@ -49,7 +51,34 @@ ORCH_SKIP_PYWORKER="${ORCH_SKIP_PYWORKER:-0}"   # 1 = manual test rental, no ser
 mkdir -p "$ORCH_DIR"
 export LD_LIBRARY_PATH="$(dirname "$LLAMA_SERVER_BIN")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-log(){ echo "[$(date -u '+%H:%M:%S')] [boot] $*" | tee -a "$MODEL_LOG"; }
+# ── where log lines go ────────────────────────────────────────────────────────
+# MODEL_LOG (the PyWorker reads markers there), this script's stdout (boot.out,
+# readable over SSH) and the container's own stdout, which is what
+# `vastai logs <id>` shows: onstart runs this script in the background, so
+# without that last copy a boot is invisible from outside. Writing there must
+# never stop a boot, so SIGPIPE is ignored and errors are dropped.
+trap '' PIPE
+if [ -z "${ORCH_CONSOLE+set}" ]; then
+    ORCH_CONSOLE=""
+    if [ -w /proc/1/fd/1 ] && [ "$(readlink /proc/1/fd/1)" != "$(readlink /proc/$$/fd/1)" ]; then
+        ORCH_CONSOLE=/proc/1/fd/1
+    fi
+fi
+console(){ [ -n "$ORCH_CONSOLE" ] && printf '%s\n' "$*" >> "$ORCH_CONSOLE" 2>/dev/null; return 0; }
+stamp(){ echo "[$(date -u '+%H:%M:%S')] [boot] $*"; }
+log(){ local l; l=$(stamp "$*"); echo "$l" | tee -a "$MODEL_LOG"; console "$l"; }
+# phase: what the boot is doing now, so a deadline failure can say where it was.
+phase(){ echo "$*" > "$ORCH_DIR/phase"; log "$*"; }
+# with_timeout SECS CMD...: steps that have hung silently on real hosts get a limit.
+with_timeout(){
+    local s="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout --kill-after=10 "$s" "$@"; else "$@"; fi
+}
+
+# GPUs without prebuilt kernels in the image run PTX the driver compiles on
+# first use. A cache big enough to hold all of it means that happens once per
+# instance instead of on every load (the driver's default cache is smaller).
+export CUDA_CACHE_MAXSIZE="${CUDA_CACHE_MAXSIZE:-4294967296}"
 
 # ── stop paying for a dead worker ─────────────────────────────────────────────
 # After ORCH_FATAL a running PyWorker reports the error; Vast marks the worker
@@ -116,7 +145,9 @@ schedule_fatal_cleanup(){
 LLAMA_PID=""; EMBED_PID=""; ROUTER_PID=""
 fatal(){
     echo "fatal" > "$STATE_FILE"
-    echo "[$(date -u '+%H:%M:%S')] [boot] $FATAL_MARK: $*" | tee -a "$MODEL_LOG" >&2
+    local l; l=$(stamp "$FATAL_MARK: $*")
+    echo "$l" | tee -a "$MODEL_LOG" >&2
+    console "$l"
     for p in $LLAMA_PID $EMBED_PID $ROUTER_PID; do kill "$p" 2>/dev/null; done
     schedule_fatal_cleanup
     exit 1
@@ -130,6 +161,7 @@ fatal(){
 echo "booting" > "$STATE_FILE"
 rmdir "$CLEANUP_MARK" 2>/dev/null
 rm -f "$PYWORKER_PIDFILE"
+echo "starting" > "$ORCH_DIR/phase"
 log "boot start (orch ref ${ORCH_REF:-unknown})"
 
 # ── manual rentals don't run forever ──────────────────────────────────────────
@@ -145,11 +177,11 @@ fi
     sleep "$BOOT_DEADLINE"
     if [ "$(cat "$STATE_FILE" 2>/dev/null)" = "booting" ]; then
         echo "fatal" > "$STATE_FILE"
-        echo "[$(date -u '+%H:%M:%S')] [boot] $FATAL_MARK: not ready within ${BOOT_DEADLINE}s" >> "$MODEL_LOG"
+        log "$FATAL_MARK: not ready within ${BOOT_DEADLINE}s (still at: $(cat "$ORCH_DIR/phase" 2>/dev/null))"
         schedule_fatal_cleanup
         # pkill exits 1 when nothing matched; anything higher means it couldn't run.
         pkill -f "$LLAMA_SERVER_BIN" 2>>"$MODEL_LOG"; rc=$?
-        [ "$rc" -le 1 ] || echo "[$(date -u '+%H:%M:%S')] [boot] warn: pkill failed (exit $rc); llama-server may still be running" >> "$MODEL_LOG"
+        [ "$rc" -le 1 ] || log "warn: pkill failed (exit $rc); llama-server may still be running"
     fi
 ) &
 
@@ -159,9 +191,10 @@ fi
 apt_install(){
     export DEBIAN_FRONTEND=noninteractive
     for i in 1 2 3; do
-        apt-get update -qq >/dev/null 2>&1 \
-            && apt-get install -y -qq --no-install-recommends ca-certificates "$@" >/dev/null 2>&1 \
+        with_timeout 300 apt-get update -qq >/dev/null 2>&1 \
+            && with_timeout 600 apt-get install -y -qq --no-install-recommends ca-certificates "$@" >/dev/null 2>&1 \
             && return 0
+        log "warn: apt-get failed or timed out (attempt $i)"
         sleep $((i * 10))
     done
     return 1
@@ -172,10 +205,11 @@ for pair in python3:python3 git:git openssl:openssl curl:curl; do
 done
 if [ ${#need[@]} -gt 0 ]; then
     [ "${ORCH_SKIP_APT:-0}" != "1" ] || fatal "missing: ${need[*]} (ORCH_SKIP_APT=1, not installing)"
-    log "installing: ${need[*]}"
+    phase "installing: ${need[*]}"
     apt_install "${need[@]}" || fatal "apt-get install failed for: ${need[*]}"
 fi
 if ! command -v aria2c >/dev/null 2>&1 && [ "${ORCH_SKIP_APT:-0}" != "1" ]; then
+    phase "installing: aria2"
     apt_install aria2 || log "warn: aria2 unavailable, downloads will use curl"
 fi
 for b in python3 git openssl curl; do
@@ -202,6 +236,7 @@ failed to load model"
     pw_dir="$WORKSPACE_DIR/vast-pyworker"
     if [ ! -d "$pw_dir/.git" ]; then
         rm -rf "$pw_dir"
+        log "cloning $PYWORKER_REPO"
         git clone -q "$PYWORKER_REPO" "$pw_dir" && git -C "$pw_dir" checkout -q "$PYWORKER_REF" \
             || fatal "could not check out $PYWORKER_REPO at $PYWORKER_REF"
     fi
@@ -223,6 +258,7 @@ else
 fi
 
 # ── GPU and driver sanity, before paying for a download ───────────────────────
+phase "checking GPU and driver"
 [ -x "$LLAMA_SERVER_BIN" ] || fatal "llama-server not found at $LLAMA_SERVER_BIN (wrong image?)"
 if command -v nvidia-smi >/dev/null 2>&1; then
     vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
@@ -230,10 +266,17 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     log "GPU: $(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | paste -sd ';')"
     [ "${vram_mb:-0}" -ge $((MIN_VRAM_GB * 1000)) ] \
         || fatal "only ${vram_mb:-0} MiB VRAM, need >= ${MIN_VRAM_GB} GB"
+    cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+    if awk -v c="$cc" 'BEGIN { exit !(c ~ /^[0-9]+\.[0-9]+$/ && c + 0 < 8.6) }'; then
+        log "note: compute capability $cc likely has no prebuilt kernels in this llama.cpp image;" \
+            "the first load compiles them, which can take many minutes"
+    fi
 else
     fatal "nvidia-smi not available — no GPU visible in this container"
 fi
-devices=$("$LLAMA_SERVER_BIN" --list-devices 2>&1)
+devices=$(with_timeout "$LIST_DEVICES_TIMEOUT" "$LLAMA_SERVER_BIN" --list-devices 2>&1); rc=$?
+[ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] \
+    || fatal "llama-server --list-devices did not finish in ${LIST_DEVICES_TIMEOUT}s (GPU or driver hung?)"
 if ! grep -qi "cuda" <<<"$devices"; then
     log "llama-server --list-devices said: $(head -c 600 <<<"$devices")"
     fatal "llama-server cannot see a CUDA device (driver too old for this image?)"
@@ -243,7 +286,8 @@ log "llama.cpp sees: $(grep -i cuda <<<"$devices" | head -3 | paste -sd ';')"
 # ── weights ───────────────────────────────────────────────────────────────────
 export PATHS_ENV="$ORCH_DIR/paths.env"
 rm -f "$PATHS_ENV"
-python3 "$ORCH_DIR/fetch_model.py" 2>&1 | tee -a "$MODEL_LOG"
+phase "downloading and verifying weights"
+python3 "$ORCH_DIR/fetch_model.py" 2>&1 | while IFS= read -r line; do echo "$line" | tee -a "$MODEL_LOG"; console "$line"; done
 rc=${PIPESTATUS[0]}
 [ "$rc" -eq 0 ] || fatal "model fetch failed (exit $rc)"
 # shellcheck disable=SC1090
@@ -252,7 +296,7 @@ rc=${PIPESTATUS[0]}
 export MODEL_PATH MMPROJ_PATH="${MMPROJ_PATH:-}"
 
 # ── llama-server ──────────────────────────────────────────────────────────────
-help=$("$LLAMA_SERVER_BIN" --help 2>&1)
+help=$(with_timeout 120 "$LLAMA_SERVER_BIN" --help 2>&1)
 has(){ grep -q -- "$1" <<<"$help"; }
 
 chat_port="$LLAMA_PORT"
@@ -273,6 +317,7 @@ if [ -n "$LLAMA_EXTRA_ARGS" ]; then
     args+=("${extra[@]}")
 fi
 
+phase "loading the model"
 log "launching llama-server: ${args[*]}"
 "$LLAMA_SERVER_BIN" "${args[@]}" >> "$MODEL_LOG" 2>&1 &
 LLAMA_PID=$!
@@ -296,27 +341,32 @@ if [ -n "${EMBED_PATH:-}" ]; then
 fi
 
 # With the router up, its /health is 200 only once both servers are healthy.
-t0=$SECONDS
+t0=$SECONDS; next_beat=$LOAD_HEARTBEAT_S
 until curl -sf "http://$LLAMA_HOST:$LLAMA_PORT/health" >/dev/null 2>&1; do
     kill -0 "$LLAMA_PID" 2>/dev/null || fatal "llama-server exited during load (see log above)"
     [ -z "$EMBED_PID" ] || kill -0 "$EMBED_PID" 2>/dev/null || fatal "embedding llama-server exited during load (see log above)"
     [ -z "$ROUTER_PID" ] || kill -0 "$ROUTER_PID" 2>/dev/null || fatal "router exited during load (see log above)"
     [ $((SECONDS - t0)) -lt "$LOAD_TIMEOUT" ] || fatal "llama-server not healthy after ${LOAD_TIMEOUT}s"
     [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] && fatal "boot deadline hit during load"
+    if [ $((SECONDS - t0)) -ge "$next_beat" ]; then
+        log "still loading after $((SECONDS - t0))s; server says: $(grep -v '\] \[boot\] ' "$MODEL_LOG" | tail -n 1 | cut -c1-200)"
+        next_beat=$((next_beat + LOAD_HEARTBEAT_S))
+    fi
     sleep 3
 done
 log "llama-server healthy after $((SECONDS - t0))s"
 
 # ── prove it works ────────────────────────────────────────────────────────────
+phase "smoke test"
 LLAMA_URL="http://$LLAMA_HOST:$LLAMA_PORT" SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     EMBED_SERVED_NAME="$([ -n "${EMBED_PATH:-}" ] && echo "${EMBED_SERVED_NAME:-embedding}")" \
-    python3 "$ORCH_DIR/smoke_test.py" 2>&1 | tee -a "$MODEL_LOG"
+    python3 "$ORCH_DIR/smoke_test.py" 2>&1 | while IFS= read -r line; do echo "$line" | tee -a "$MODEL_LOG"; console "$line"; done
 [ "${PIPESTATUS[0]}" -eq 0 ] || fatal "smoke test failed"
 
 [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] && fatal "boot deadline hit"
 echo "ready" > "$STATE_FILE"
-echo "[$(date -u '+%H:%M:%S')] [boot] $READY_MARK model=$SERVED_MODEL_NAME" >> "$MODEL_LOG"
-log "worker ready"
+echo "ready" > "$ORCH_DIR/phase"
+log "$READY_MARK model=$SERVED_MODEL_NAME"
 
 # ── stay up with the servers; report the first one that dies ─────────────────
 wait -n $LLAMA_PID $EMBED_PID $ROUTER_PID

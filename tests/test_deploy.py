@@ -3,6 +3,7 @@
 endpoints or workergroups, no destroying on a guess, orphans found and
 confirmed gone, spend limits enforced. Run: python3 tests/test_deploy.py"""
 
+import builtins
 import copy
 import os
 import re
@@ -665,6 +666,109 @@ def cheaper_example_config_within_limits():
     assert (cfg["model"]["mmproj_repo"], cfg["model"]["mmproj_file"]) == \
         (BASE_CFG["model"]["mmproj_repo"], BASE_CFG["model"]["mmproj_file"])
     assert set(cfg) == set(BASE_CFG), set(cfg) ^ set(BASE_CFG)
+
+
+class LogVast:
+    """vastai logs returns the whole (tail of the) container log each call."""
+    def __init__(self, logs, status="running"):
+        self.logs_seq, self.status, self.calls = list(logs), status, 0
+
+    def logs(self, instance_id, tail=None):
+        self.calls += 1
+        out = self.logs_seq[min(self.calls, len(self.logs_seq)) - 1]
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    def show_instance(self, id):
+        return {"id": id, "actual_status": self.status} if self.status else None
+
+
+def follow(v, **kw):
+    out, real = [], deploy.say
+    deploy.say = out.append
+    try:
+        return deploy.follow_instance_logs(v, 5, kw.pop("timeout", 60), poll=0, **kw), out
+    finally:
+        deploy.say = real
+
+
+@case
+def confirm_without_terminal_stops_cleanly():
+    """with no terminal, a prompt stops with a hint to pass --yes instead of crashing, and nothing is rented"""
+    real_stdin, real_input = sys.stdin, builtins.input
+    class NoTTY:
+        def isatty(self):
+            return False
+    class TTY:
+        def isatty(self):
+            return True
+    try:
+        sys.stdin = NoTTY()
+        raises(lambda: deploy.confirm("rent it?", False), SystemExit, "pass --yes")
+        assert deploy.confirm("rent it?", True)
+        sys.stdin = TTY()
+        def eof(_):
+            raise EOFError
+        builtins.input = eof
+        raises(lambda: deploy.confirm("rent it?", False), SystemExit, "pass --yes")
+        builtins.input = real_input
+        sys.stdin = NoTTY()
+        v = FakeVast()
+        deploy.vast = lambda: v
+        real_check = deploy.check
+        deploy.check = lambda cfg, v=None: PINS
+        try:
+            raises(lambda: deploy.cmd_rent_test(BASE_CFG, args(yes=False)), SystemExit, "pass --yes")
+        finally:
+            deploy.check = real_check
+        assert not v.made("create_instance") and not deploy.load_state().get("manual_instances")
+    finally:
+        sys.stdin = real_stdin
+        builtins.input = real_input
+
+
+@case
+def logs_follows_an_instance_until_ready():
+    """logs ID prints each new container log line once and stops at ORCH_READY"""
+    v = LogVast([RuntimeError("Result not ready"),
+                 "ssh setup\n[00:01:00] [boot] boot start",
+                 "ssh setup\n[00:01:00] [boot] boot start\n[00:02:00] [fetch] model.gguf: 1.00/16.00 GiB (6%)",
+                 "ssh setup\n[00:01:00] [boot] boot start\n[00:02:00] [fetch] model.gguf: 1.00/16.00 GiB (6%)"
+                 "\n[00:20:00] [boot] ORCH_READY model=waifugemma4"])
+    r, out = follow(v)
+    assert r == "ready", (r, out)
+    assert out.count("[00:01:00] [boot] boot start") == 1 and out[-1].endswith("ORCH_READY model=waifugemma4"), out
+    assert any("no log from Vast yet" in o for o in out), out
+
+
+@case
+def logs_reports_fatal_gone_and_timeout():
+    """logs ID returns fatal on ORCH_FATAL, gone when the instance stops silently, timeout otherwise"""
+    assert follow(LogVast(["[t] [boot] ORCH_FATAL: model fetch failed (exit 4)"]))[0] == "fatal"
+    r, out = follow(LogVast(["ssh setup"], status="exited"))
+    assert r == "gone" and "exited" in out[-1], out
+    assert follow(LogVast(["ssh setup"], status=None))[0] == "gone"
+    r, out = follow(LogVast(["ssh setup"]), timeout=0)
+    assert r == "timeout" and "model.log" in out[-1], out
+    r, out = follow(LogVast(["ssh setup", "never read"]), once=True)
+    assert r == "once" and out == ["ssh setup"], out
+    # the env var naming the marker is not the marker
+    assert follow(LogVast(["ORCH_FATAL_GRACE=600"]), timeout=0)[0] == "timeout"
+
+
+@case
+def logs_command_exit_code_follows_the_marker():
+    """deploy.py logs ID exits 1 on ORCH_FATAL and 0 on ORCH_READY"""
+    deploy.vast = lambda: LogVast(["[t] [boot] ORCH_FATAL: smoke test failed"])
+    real = deploy.say
+    deploy.say = lambda *a: None
+    try:
+        raises(lambda: deploy.cmd_logs(BASE_CFG, args(instance_id=5, timeout=60, once=False)), SystemExit)
+        deploy.vast = lambda: LogVast(["[t] [boot] ORCH_READY model=x"])
+        deploy.cmd_logs(BASE_CFG, args(instance_id=5, timeout=60, once=False))
+    finally:
+        deploy.say = real
 
 
 print(f"---- {len(PASSED)} passed, {len(FAILED)} failed")
