@@ -13,7 +13,8 @@ mmproj_file     = "mmproj-WaifuGemma4-26b-a4b-v1-f16.gguf"
 mmproj_revision = "main"
 
 [llama]
-image            = "ghcr.io/ggml-org/llama.cpp:server-cuda-b11379"   # upstream llama.cpp, pinned build
+image            = "ghcr.io/ggml-org/llama.cpp:server-cuda-b11371"   # upstream llama.cpp, pinned build (CUDA 12.8)
+# Not every llama.cpp release gets an image; `check` names the newest older one if this tag is missing.
 ctx              = 32768     # total context; shared by all slots (--kv-unified)
 parallel         = 2         # slots; the Vast benchmark sends concurrent requests
 cache_type       = "q8_0"    # KV cache type for K and V
@@ -34,8 +35,13 @@ inactivity_timeout = 900     # seconds idle before workers are released; verify 
 test_workers  = 1            # instances spun up to benchmark a new hardware type (default 3)
 gpu_ram       = 24
 # Your constraints live here: price ceiling (dph_total), VRAM floor (gpu_ram),
-# CUDA driver floor for the image (cuda_max_good), download speed (inet_down).
-search_params = "num_gpus=1 gpu_ram>=22 dph_total<=0.40 cuda_max_good>=12.8 inet_down>=500 reliability>0.98 direct_port_count>=1"
+# CUDA driver floor for the image (cuda_max_good), GPU generation (compute_cap),
+# download speed (inet_down). The server-cuda image (CUDA 12.8) ships compiled
+# code for Ampere 8.6, Ada 8.9 and Blackwell 12.0, and PTX that the driver
+# JIT-compiles on first start for the rest (Turing 7.5, A100 8.0, ...).
+# compute_cap (x100) >= 750 keeps Pascal (P40) and Volta (V100) out: no int8
+# tensor cores and slow FP16.
+search_params = "num_gpus=1 gpu_ram>=22 dph_total<=0.40 cuda_max_good>=12.8 compute_cap>=750 inet_down>=500 reliability>0.98 direct_port_count>=1"
 
 [limits]
 # `check` (and so `apply`) refuses configs that could spend more than this.
