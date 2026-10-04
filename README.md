@@ -154,6 +154,12 @@ docker compose build
 alias orch='docker compose run --rm deploy'        # orch check, orch apply, ...
 ```
 
+Commands that rent or delete something (`rent-test`, `destroy`, `sweep
+--destroy`) ask first. `docker compose run` attaches a terminal, so you can
+answer; where nothing can answer (scripts, cron, `-T`), they stop with "no
+terminal to confirm on" and change nothing. Pass `--yes` to go ahead without
+asking.
+
 If `docker compose build` warns "Docker Compose is configured to build using
 Bake, but buildx isn't installed", it's harmless: compose falls back to the
 classic builder. Install the buildx plugin or set `COMPOSE_BAKE=false` to
@@ -181,9 +187,17 @@ alias orch='python3 deploy/deploy.py'
 
 ```bash
 orch rent-test        # cheapest matching offer, no serverless; records the id
+orch logs <id>        # follows the boot until ORCH_READY (exit 0) or ORCH_FATAL (exit 1)
 ```
 
-Then, on the instance (`vastai ssh-url <id>`):
+`logs <id>` reads the container log through Vast (`vastai logs <id>` shows the
+same lines): each boot step, download progress every 30 s, a line a minute
+while the model loads, and the final marker. If the boot runs out of time, the
+ORCH_FATAL line names the step it was stuck at. `--once` prints what is there
+now without waiting.
+
+For the full log, including llama-server's own output, on the instance
+(`vastai ssh-url <id>`):
 
 ```bash
 tail -f /workspace/orch/model.log      # wait for ORCH_READY (or ORCH_FATAL with the reason)
@@ -205,7 +219,8 @@ orch status           # first worker: download, load, smoke test, Vast benchmark
 ```
 
 `check` must pass before `apply` changes anything. The state file records
-what was created; keep it. Other commands: `logs`, `pause` (workers go inactive,
+what was created; keep it. Other commands: `logs` (the autoscaler's log;
+`logs <id>` follows one instance's boot), `pause` (workers go inactive,
 storage cost only), `resume`, `sweep` (destroy orphaned instances), `destroy`,
 `watch` (the watchdog; run it as a service next to the shim).
 

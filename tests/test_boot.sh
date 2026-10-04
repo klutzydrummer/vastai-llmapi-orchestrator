@@ -45,11 +45,11 @@ run_case(){
     local orch="$WORK/orch"
     mkdir -p "$orch"
     cp "$REPO/worker/"{boot.sh,fetch_model.py,smoke_test.py,router.py,pyworker_worker.py} "$orch/"
-    rm -f "$orch/model.log" "$orch/model.log.prev"
+    rm -f "$orch/model.log" "$orch/model.log.prev" "$orch/console.log"
     pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; sleep 0.3
     env PATH="$WORK/bin:$PATH" ORCH_DIR="$orch" MODEL_LOG="$orch/model.log" \
         ORCH_SKIP_PYWORKER=1 ORCH_SKIP_APT=1 LLAMA_SERVER_BIN="$WORK/bin/llama-server" \
-        HF_ENDPOINT="http://127.0.0.1:$HF_PORT" MODELS_DIR="$WORK/models" WORKSPACE_DIR="$WORK/workspace" \
+        ORCH_CONSOLE="$orch/console.log" HF_ENDPOINT="http://127.0.0.1:$HF_PORT" MODELS_DIR="$WORK/models" WORKSPACE_DIR="$WORK/workspace" \
         MODEL_REPO=test/repo MODEL_FILE=model.gguf MMPROJ_FILE=mmproj.gguf \
         SERVED_MODEL_NAME=testmodel BOOT_DEADLINE=60 "$@" \
         setsid bash "$orch/boot.sh" > "$orch/boot.out" 2>&1 &
@@ -73,11 +73,20 @@ run_case(){
         sed 's/^/      /' "$orch/model.log" | tail -25
     fi
     LAST_LOG="$orch/model.log"
+    LAST_CONSOLE="$orch/console.log"
+}
+# check NAME CMD...: one PASS/FAIL line for a condition after a case
+check(){
+    local name="$1"; shift
+    if "$@"; then echo "PASS  $name"; PASS=$((PASS+1)); else echo "FAIL  $name"; FAIL=$((FAIL+1)); fi
 }
 
 start_hub
 run_case "fresh boot downloads, verifies, gates on smoke test" ready 60
 grep -q "ORCH_READY model=testmodel" "$LAST_LOG" || { echo "FAIL  ready marker format"; FAIL=$((FAIL+1)); }
+check "boot and fetch lines and ORCH_READY reach the container console" \
+    grep -q "ORCH_READY model=testmodel" "$LAST_CONSOLE"
+check "fetch output reaches the container console" grep -q "\[fetch\] all files present and verified" "$LAST_CONSOLE"
 grep -q -- "--mmproj" "$LAST_LOG" && grep -q -- "--kv-unified" "$LAST_LOG" \
     && echo "PASS  llama-server got --mmproj and --kv-unified" && PASS=$((PASS+1)) \
     || { echo "FAIL  expected flags missing"; FAIL=$((FAIL+1)); }
@@ -111,6 +120,17 @@ run_case "llama-server crashes during load" fatal 30 FAKE_LLAMA_MODE=crash
 run_case "vision not loaded (bad mmproj)" fatal 30 FAKE_LLAMA_MODE=novision
 run_case "text request fails" fatal 30 FAKE_LLAMA_MODE=textfail
 run_case "boot deadline" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
+check "deadline failure names the step it was stuck at" grep -q "not ready within 6s (still at: loading the model)" "$LAST_LOG"
+check "deadline ORCH_FATAL reaches the container console" grep -q "ORCH_FATAL: not ready within 6s" "$LAST_CONSOLE"
+run_case "slow load prints progress" ready 40 FAKE_LLAMA_LOAD_SECS=5 LOAD_HEARTBEAT_S=1
+check "loading heartbeat reaches the console" grep -q "still loading after" "$LAST_CONSOLE"
+run_case "hung device listing times out" fatal 30 FAKE_LLAMA_MODE=hang_devices LIST_DEVICES_TIMEOUT=2
+check "says which step hung" grep -q "list-devices did not finish in 2s" "$LAST_LOG"
+start_hub --slow 4
+rm -rf "$WORK/models"
+run_case "slow download prints progress" ready 60 DOWNLOAD_PROGRESS_S=1
+check "download progress reaches the console" grep -Eq "\[fetch\] model.gguf: [0-9.]+/[0-9.]+ GiB" "$LAST_CONSOLE"
+start_hub
 NOPKILL="$WORK/nopkill"; path_without "$NOPKILL" pkill
 HOLD=1 run_case "boot deadline without pkill" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6 PATH="$NOPKILL"
 grep -q "warn: pkill failed" "$LAST_LOG" \

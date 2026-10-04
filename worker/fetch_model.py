@@ -20,6 +20,7 @@ Configuration (environment):
   DOWNLOAD_MAX_ATTEMPTS default 5
   DOWNLOAD_CONNECTIONS  aria2c connections per file, default 16
   MIN_FREE_GB_AFTER     free space to leave on disk, default 2
+  DOWNLOAD_PROGRESS_S   seconds between progress lines, default 30
 
 Exit status: 0 ok, 2 bad configuration / file not found on the Hub,
 3 not enough disk, 4 download failed, 5 verification failed.
@@ -43,6 +44,7 @@ PATHS_ENV = os.environ.get("PATHS_ENV", "/workspace/orch/paths.env")
 MAX_ATTEMPTS = int(os.environ.get("DOWNLOAD_MAX_ATTEMPTS", "5"))
 CONNECTIONS = max(1, min(16, int(os.environ.get("DOWNLOAD_CONNECTIONS", "16"))))
 MIN_FREE_AFTER = float(os.environ.get("MIN_FREE_GB_AFTER", "2")) * 1024**3
+PROGRESS_S = max(1.0, float(os.environ.get("DOWNLOAD_PROGRESS_S", "30")))
 
 EXIT_CONFIG, EXIT_DISK, EXIT_DOWNLOAD, EXIT_VERIFY = 2, 3, 4, 5
 
@@ -108,6 +110,7 @@ def hub_file_info(repo, revision, path):
 
 
 def sha256_of(path):
+    log(f"hashing {os.path.basename(path)} ({os.path.getsize(path) / 1024**3:.2f} GiB)")
     h = hashlib.sha256()
     t0 = time.time()
     with open(path, "rb") as f:
@@ -142,12 +145,42 @@ def write_marker(dest, size, sha):
         json.dump({"sha256": sha, "size": size, "verified_at": int(time.time())}, f)
 
 
+def on_disk(path):
+    """Bytes actually written: aria2c writes parts at their offsets, so the
+    file's apparent size jumps ahead of what has arrived."""
+    try:
+        st = os.stat(path)
+        return min(st.st_size, st.st_blocks * 512)
+    except OSError:
+        return 0
+
+
+def run_with_progress(cmd, dest, size):
+    """Run the downloader, logging how far it has got every PROGRESS_S seconds,
+    so a slow or stalled download shows up in the log while it happens."""
+    p = subprocess.Popen(cmd)
+    t0 = last_t = time.time()
+    last_b = start_b = on_disk(dest)
+    while True:
+        try:
+            return p.wait(timeout=PROGRESS_S)
+        except subprocess.TimeoutExpired:
+            pass
+        now, got = time.time(), on_disk(dest)
+        rate = (got - last_b) / max(now - last_t, 1e-6)
+        avg = (got - start_b) / max(now - t0, 1e-6)
+        left = f", ~{(size - got) / avg / 60:.0f} min left" if avg > 0 else ""
+        log(f"{os.path.basename(dest)}: {got / 1024**3:.2f}/{size / 1024**3:.2f} GiB "
+            f"({100 * got / max(size, 1):.0f}%), {rate / 1e6:.1f} MB/s{left}")
+        last_t, last_b = now, got
+
+
 def download(url, dest, size):
     tmp_dir, name = os.path.dirname(dest), os.path.basename(dest)
     if shutil.which("aria2c"):
         cmd = ["aria2c", f"-x{CONNECTIONS}", f"-s{CONNECTIONS}", "-k1M", "-c",
                "--file-allocation=none", "--auto-file-renaming=false",
-               "--allow-overwrite=true", "--summary-interval=30",
+               "--allow-overwrite=true", "--summary-interval=0",
                "--console-log-level=warn", "--download-result=hide",
                "--max-tries=5", "--retry-wait=5", "--timeout=60",
                "--connect-timeout=30", "--lowest-speed-limit=512K",
@@ -162,7 +195,7 @@ def download(url, dest, size):
         if HF_TOKEN:
             cmd += ["-H", f"Authorization: Bearer {HF_TOKEN}"]
         cmd.append(url)
-    rc = subprocess.call(cmd)
+    rc = run_with_progress(cmd, dest, size)
     got = os.path.getsize(dest) if os.path.exists(dest) else 0
     if rc != 0 or got != size:
         raise FetchError(f"download of {name} incomplete (exit {rc}, {got}/{size} bytes)", EXIT_DOWNLOAD)

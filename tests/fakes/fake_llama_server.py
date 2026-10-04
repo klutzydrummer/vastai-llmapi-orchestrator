@@ -32,10 +32,13 @@ HELP = """usage: llama-server [options]
 """
 
 argv = sys.argv[1:]
+MODE_EARLY = os.environ.get("FAKE_LLAMA_MODE", "ok")
 if "--help" in argv:
     print(HELP)
     sys.exit(0)
 if "--list-devices" in argv:
+    if MODE_EARLY == "hang_devices":
+        time.sleep(600)
     print("Available devices:\n  CUDA0: FAKE GPU (24000 MiB, 23000 MiB free)")
     sys.exit(0)
 

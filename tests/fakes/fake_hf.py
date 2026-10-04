@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Tiny stand-in for the Hugging Face Hub: paths-info + resolve (with Range).
 
-Usage: fake_hf.py PORT DIR [--corrupt NAME]
+Usage: fake_hf.py PORT DIR [--corrupt NAME] [--slow SECS]
 Every file in DIR is served as repo "test/repo". With --corrupt NAME the Hub
-reports a wrong sha256 for that file, to exercise verification failure.
+reports a wrong sha256 for that file, to exercise verification failure. With
+--slow SECS each download is spread over about SECS seconds.
 """
 import hashlib
 import json
 import os
 import sys
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT, ROOT = int(sys.argv[1]), sys.argv[2]
 CORRUPT = sys.argv[sys.argv.index("--corrupt") + 1] if "--corrupt" in sys.argv else None
+SLOW = float(sys.argv[sys.argv.index("--slow") + 1]) if "--slow" in sys.argv else 0
 
 
 def info(name):
@@ -65,7 +68,15 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(len(data) - start))
         self.end_headers()
-        self.wfile.write(data[start:])
+        body = data[start:]
+        if not SLOW:
+            self.wfile.write(body)
+            return
+        step = max(1, len(body) // 20)
+        for i in range(0, len(body), step):
+            self.wfile.write(body[i:i + step])
+            self.wfile.flush()
+            time.sleep(SLOW / 20)
 
 
 ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
