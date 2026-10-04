@@ -6,15 +6,20 @@ A small **shim** runs at home and looks like any OpenAI-style API to
 SillyTavern. Behind it, **Vast.ai Serverless** rents the cheapest GPU that
 matches your constraints when a request arrives, and releases it when things go
 quiet. Each GPU runs upstream llama.cpp (`ghcr.io/ggml-org/llama.cpp`, pinned
-build) serving one GGUF model plus its vision projector.
+build) serving one chat GGUF model plus its vision projector and, optionally,
+an embedding model for `/v1/embeddings`.
 
 ```
 SillyTavern ──► shim (home, :8787) ──► Vast autoscaler ──► worker (rented GPU)
                  │ /v1/models answered      picks cheapest      PyWorker :3000
-                 │ locally                  offer matching      llama-server :18000
-                 │ keepalives during        search_params       (GGUF + mmproj)
-                 └ cold start
+                 │ locally                  offer matching      router :18000
+                 │ keepalives during        search_params       ├ chat llama-server :18010
+                 └ cold start                                   │   (GGUF + mmproj)
+                                                                └ embedding llama-server :18011
 ```
+
+Without an `[embedding]` section there is no router: the chat llama-server
+listens on :18000 itself.
 
 ## What keeps you from paying for a broken container
 
@@ -28,7 +33,7 @@ the autoscaler drops that worker instead of billing for it.
 | download | file exists at the **pinned commit** on the Hub; enough disk | fatal |
 | verify | size + **sha256 match the Hub's LFS hash**; GGUF magic bytes | file deleted, fatal |
 | load | `llama-server` stays alive and `/health` goes 200 within `load_timeout_s` | fatal |
-| smoke test | `/props` reports vision on; a text request and a **real image request** both return text | fatal |
+| smoke test | `/props` reports vision on; a text request and a **real image request** both return text; with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
 | deadline | whole boot finishes within `deadline_s` | fatal |
 | serving | `llama-server` exits later | fatal |
 | after fatal | no PyWorker left to report it, `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
@@ -114,7 +119,9 @@ echoed back by `show_workergroups` (unconfirmed ones are printed).
 worker/onstart.sh       template on-start: fetches the worker scripts at the pinned commit
 worker/boot.sh          the boot sequence above
 worker/fetch_model.py   Hub lookup, resumable download (aria2c, curl fallback), sha256 verify
-worker/smoke_test.py    /props + text + image checks
+worker/smoke_test.py    /props + text + image (+ embedding) checks
+worker/router.py        sends /v1/embeddings to the embedding llama-server, the rest to chat
+worker/pyworker_worker.py  Vast's llama PyWorker routes plus /v1/embeddings
 shim/shim.py            OpenAI-compatible proxy (vastai SDK client)
 deploy/deploy.py        preflight, template / endpoint / workergroup, rent-test, sweep, watch, destroy
 deploy/orch-watch.service  systemd unit for `deploy.py watch`
@@ -235,9 +242,12 @@ plain systemd units (both read `shim/.env`).
 
 Chat Completion → Custom (OpenAI-compatible): base URL `http://<homelab>:8787/v1`,
 API key = `SHIM_API_KEY` (anything if unset), model = `served_name`.
+For vector storage / RAG, point the embedding source at the same base URL
+(OpenAI-compatible); the model is `embedding.served_name` (`EMBED_MODEL_NAME`
+in `shim/.env`). An embedding request wakes a worker like any other.
 
 The first message after an idle period waits for a worker. The example config
-keeps no stopped workers (`cold_workers = 0`), so every start downloads ~18 GB
+keeps no stopped workers (`cold_workers = 0`), so every start downloads ~29 GB
 on a fresh machine; set `cold_workers = 1` to keep one stopped worker with the
 weights on disk (storage cost only), which resumes in a few minutes. Streaming shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
@@ -246,8 +256,8 @@ states.
 ## Tuning
 
 - **Context:** `llama.ctx` is shared across `parallel` slots (`--kv-unified`),
-  so one long chat can use all of it. The model was trained at 8K; the base
-  supports far more.
+  so one long chat can use all of it. A larger context costs VRAM for the KV
+  cache; raise `min_vram_gb` and `gpu_ram` with it.
 - **Price vs speed:** loosen or tighten `search_params`. `inet_down` matters
   because a slow host bills you for every minute spent downloading.
 - **Quant:** change `model.file`; `check` confirms it exists and that disk fits.

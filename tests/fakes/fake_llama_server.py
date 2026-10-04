@@ -5,6 +5,8 @@ Behaviour knobs (env):
   FAKE_LLAMA_MODE  ok (default) | crash (exit during load) | novision |
                    textfail | die_after_ready
   FAKE_LLAMA_LOAD_SECS  seconds of 503 before /health turns 200 (default 2)
+  FAKE_EMBED_MODE  ok (default) | zero (all-zero vectors) | crash (the
+                   --embedding server exits during load)
 """
 import json
 import os
@@ -14,6 +16,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODE = os.environ.get("FAKE_LLAMA_MODE", "ok")
+EMBED_MODE = os.environ.get("FAKE_EMBED_MODE", "ok")
 LOAD = float(os.environ.get("FAKE_LLAMA_LOAD_SECS", "2"))
 
 HELP = """usage: llama-server [options]
@@ -43,6 +46,9 @@ def arg(flag, default=None):
 
 port = int(arg("--port", "8080"))
 has_mmproj = "--mmproj" in argv
+embedding = "--embedding" in argv
+if embedding:
+    MODE = "crash" if EMBED_MODE == "crash" else "ok"
 for f in (arg("-m"), arg("--mmproj")):
     if f and not os.path.exists(f):
         print(f"error loading model: {f} missing", flush=True)
@@ -74,6 +80,19 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if embedding:
+            if self.path != "/v1/embeddings":
+                self._json(501, {"error": {"message": "embedding server: chat not supported"}})
+                return
+            inp = body.get("input")
+            items = inp if isinstance(inp, list) else [inp]
+            val = 0.0 if EMBED_MODE == "zero" else 0.5
+            self._json(200, {"object": "list", "model": body.get("model"), "data": [
+                {"object": "embedding", "index": i, "embedding": [val] * 8} for i in range(len(items))]})
+            return
+        if self.path == "/v1/embeddings":
+            self._json(501, {"error": {"message": "chat server: embeddings not enabled"}})
+            return
         if MODE == "textfail":
             self._json(500, {"error": {"message": "boom"}})
             return

@@ -11,8 +11,9 @@ Configuration (environment):
   MODEL_REPO, MODEL_FILE, MODEL_REVISION      main GGUF (revision defaults to main)
   MMPROJ_REPO, MMPROJ_FILE, MMPROJ_REVISION   vision projector (optional; repo
                                               defaults to MODEL_REPO)
+  EMBED_REPO, EMBED_FILE, EMBED_REVISION      embedding model (optional)
   MODELS_DIR            where files go (default /workspace/models)
-  PATHS_ENV             where to write MODEL_PATH=/MMPROJ_PATH= (default
+  PATHS_ENV             where to write MODEL_PATH=/MMPROJ_PATH=/EMBED_PATH= (default
                         /workspace/orch/paths.env)
   HF_TOKEN              optional, for gated/private repos
   HF_ENDPOINT           default https://huggingface.co
@@ -237,6 +238,13 @@ def main():
     paths = {"MODEL_PATH": fetch(model_repo, model_rev, model_file)}
     if mm_file:
         paths["MMPROJ_PATH"] = fetch(mm_repo, mm_rev, mm_file)
+    embed_file = os.environ.get("EMBED_FILE", "").strip()
+    if embed_file:
+        embed_repo = os.environ.get("EMBED_REPO", "").strip()
+        if not embed_repo:
+            raise FetchError("EMBED_FILE is set but EMBED_REPO is not", EXIT_CONFIG)
+        embed_rev = os.environ.get("EMBED_REVISION", "").strip() or "main"
+        paths["EMBED_PATH"] = fetch(embed_repo, embed_rev, embed_file)
 
     os.makedirs(os.path.dirname(PATHS_ENV), exist_ok=True)
     with open(PATHS_ENV, "w") as f:

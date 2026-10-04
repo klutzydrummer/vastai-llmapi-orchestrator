@@ -104,6 +104,16 @@ def docker_options(cfg, pins):
         "PYWORKER_REF": b["pyworker_ref"],
         "VAST_SDK_VERSION": b["vast_sdk_version"],
     }
+    e = cfg.get("embedding")
+    if e:
+        env.update({
+            "EMBED_SERVED_NAME": e["served_name"],
+            "EMBED_REPO": e["repo"],
+            "EMBED_FILE": e["file"],
+            "EMBED_REVISION": pins.get("embed_revision", ""),
+            "EMBED_CTX": e.get("ctx", 8192),
+            "EMBED_POOLING": e.get("pooling", "last"),
+        })
     parts = ["-p 3000:3000"]
     for k, v in env.items():
         if v == "" or v is None:
@@ -303,6 +313,14 @@ def check(cfg, v=None):
                 sizes.append(sz)
     else:
         say("  warn  no mmproj configured: image input will not work")
+    e = cfg.get("embedding")
+    if e:
+        pins["embed_revision"] = step(f"{e['repo']}@{e.get('revision', 'main')}",
+                                      lambda: hf_resolve(e["repo"], e.get("revision", "main")))
+        if pins["embed_revision"]:
+            sz = step(e["file"], lambda: hf_file_size(e["repo"], pins["embed_revision"], e["file"]))
+            if sz:
+                sizes.append(sz)
 
     weights_gb = sum(sizes) / 1024**3
     if sizes:
@@ -312,20 +330,24 @@ def check(cfg, v=None):
             problems.append(f"template.disk_gb={cfg['template']['disk_gb']} is too small; use >= {need_disk:.0f}")
             say("  FAIL  disk too small")
         if weights_gb + 2.5 > l["min_vram_gb"]:
-            say(f"  warn  weights {weights_gb:.1f} GiB leave little room for KV cache under "
+            say(f"  warn  weights (all models) {weights_gb:.1f} GiB leave little room for KV cache under "
                 f"min_vram_gb={l['min_vram_gb']}")
 
     say("worker code and image")
     pins["orch_ref"] = step(f"github {b['orch_repo']}@{b['orch_ref']}", lambda: gh_resolve(b["orch_repo"], b["orch_ref"]))
     if pins["orch_ref"]:
-        for f in ("worker/onstart.sh", "worker/boot.sh", "worker/fetch_model.py", "worker/smoke_test.py"):
+        for f in ("worker/onstart.sh", "worker/boot.sh", "worker/fetch_model.py", "worker/smoke_test.py",
+                  "worker/router.py", "worker/pyworker_worker.py"):
             def _has(f=f):
                 if not gh_raw_exists(b["orch_repo"], pins["orch_ref"], f):
                     raise CheckFailed("not found at that commit (push it first)")
             step(f"  {f}", _has)
     def _pyworker():
-        if not gh_raw_exists("vast-ai/pyworker", b["pyworker_ref"], "workers/llama/worker.py"):
-            raise CheckFailed("workers/llama/worker.py missing at that ref")
+        # worker/pyworker_worker.py imports workers/openai/core.py and is run by
+        # that ref's start_server.sh.
+        for f in ("start_server.sh", "workers/openai/core.py"):
+            if not gh_raw_exists("vast-ai/pyworker", b["pyworker_ref"], f):
+                raise CheckFailed(f"{f} missing at that ref")
     step(f"vast-ai/pyworker@{b['pyworker_ref'][:12]}", _pyworker)
     ok = image_exists(l["image"])
     if ok is False:
