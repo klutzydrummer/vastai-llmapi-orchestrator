@@ -151,14 +151,30 @@ start_hub
 cat > "$WORK/bin/fake-hf-python" <<'EOF2'
 #!/usr/bin/env bash
 [ -n "${FAKE_HF_FAIL:-}" ] && { echo "fake hf: failing" >&2; exit 1; }
-repo="$2" path="$3" rev="$4" dir="$5"
+repo="$2" path="$3" rev="$4" dir="$5" progress="${6:-}"
 tmp="$dir/.cache/huggingface/download/$path.x.incomplete"
 mkdir -p "$(dirname "$tmp")" "$(dirname "$dir/$path")"
+# FAKE_HF_LATE=N: like hf_xet, data arrives for N seconds before anything is
+# written to disk; progress goes to the progress file unless FAKE_HF_NOPROGRESS.
+if [ -n "${FAKE_HF_LATE:-}" ]; then
+    for i in $(seq $((FAKE_HF_LATE * 2))); do
+        [ -n "$progress" ] && [ -z "${FAKE_HF_NOPROGRESS:-}" ] && echo $((i * 5000000)) > "$progress"
+        sleep 0.5
+    done
+fi
 curl -fsS "$HF_ENDPOINT/$repo/resolve/$rev/$path" -o "$tmp" && mv -f "$tmp" "$dir/$path"
 EOF2
 chmod +x "$WORK/bin/fake-hf-python"
 run_case "weights through huggingface_hub" ready 60 DOWNLOAD_METHOD=auto HF_PYTHON="$WORK/bin/fake-hf-python"
 check "uses huggingface_hub when it is available" grep -q "model.gguf: downloading with huggingface_hub/hf_xet" "$LAST_LOG"
+check "says whether a Hugging Face token is set" grep -q "Hugging Face token: not set" "$LAST_LOG"
+rm -rf "$WORK/models"
+LATE=(DOWNLOAD_METHOD=auto HF_PYTHON="$WORK/bin/fake-hf-python" FAKE_HF_LATE=5
+      DOWNLOAD_MIN_MBPS=1 DOWNLOAD_PROBE_S=2 DOWNLOAD_STALL_S=3 DOWNLOAD_PROGRESS_S=1)
+run_case "hf_xet writing late is not mistaken for slow or stalled" ready 60 "${LATE[@]}"
+check "progress counts bytes received, not bytes on disk" grep -Eq "\[fetch\] model.gguf: 0\.0[1-9]" "$LAST_LOG"
+rm -rf "$WORK/models"
+run_case "without progress reports, the same download is judged too slow" fatal 60 "${LATE[@]}" FAKE_HF_NOPROGRESS=1
 rm -rf "$WORK/models"
 run_case "huggingface_hub failing falls back to direct download" ready 90 DOWNLOAD_METHOD=auto \
     HF_PYTHON="$WORK/bin/fake-hf-python" FAKE_HF_FAIL=1

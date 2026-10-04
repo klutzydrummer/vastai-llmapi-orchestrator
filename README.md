@@ -225,9 +225,10 @@ storage cost only), `resume`, `sweep` (destroy orphaned instances), `destroy`,
 `watch` (the watchdog; run it as a service next to the shim).
 
 The repo must be public, and the commit you deploy must be pushed: workers
-fetch their scripts from `raw.githubusercontent.com` at that commit. For gated
-Hugging Face repos, set `HF_TOKEN` in your Vast account's environment
-variables, not in the template.
+fetch their scripts from `raw.githubusercontent.com` at that commit. Set
+`HF_TOKEN` (a read token) in your Vast account's environment variables, not
+in the template: gated repos need it, and Hugging Face gives unauthenticated
+downloads lower rate limits. The boot log says whether it is set.
 
 ### 3. Run the shim and watchdog at home
 
@@ -296,8 +297,10 @@ Workers download weights with `huggingface_hub` + `hf_xet` (pinned versions,
 installed into a venv on the worker), which is Hugging Face's recommended way
 to fetch Xet-stored files. If that can't be set up, they fall back to aria2c,
 then curl. Every file is still checked against the pinned revision's size and
-sha256. The log shows the method and progress every 30 s, and the final
-speed.
+sha256. The log shows the method, progress every 30 s and the final speed.
+hf_xet holds data in memory and writes the file late and out of order, so
+progress and the speed checks below count the bytes huggingface_hub reports
+as received, not the file's size on disk.
 
 A host's advertised `inet_down` is not what you get from Hugging Face: a test
 on a 1336 Mbps host managed 5–11 MB/s over plain HTTP. So the download has its
