@@ -28,6 +28,7 @@ Needs VAST_API_KEY in the environment.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -40,7 +41,8 @@ import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-STATE_PATH = os.path.join(HERE, "state.json")
+# In the container this points at a mounted volume (see compose.yaml).
+STATE_PATH = os.environ.get("ORCH_STATE_PATH") or os.path.join(HERE, "state.json")
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 GH_API = "https://api.github.com"
 GH_RAW = "https://raw.githubusercontent.com"
@@ -360,25 +362,32 @@ def save_state(st):
     os.replace(tmp, STATE_PATH)
 
 
+LOCK_WAIT_S = 60        # how long a command waits for another run (e.g. a watch tick) to finish
+
+
 class StateLock:
-    """Stops two apply/destroy/sweep runs from racing each other into duplicates."""
+    """Stops two apply/destroy/sweep/watch runs from racing each other into
+    duplicates. An flock: the kernel releases it if the holder dies, so a
+    crashed or killed run (or container) never leaves a stale lock behind."""
 
     def __enter__(self):
         self.path = STATE_PATH + ".lock"
-        try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            raise CheckFailed(f"{self.path} exists: another apply/destroy/sweep is running, or one crashed. "
-                              "If none is running, delete that file and retry")
-        os.write(fd, f"{os.getpid()}\n".encode())
-        os.close(fd)
-        return self
+        self.f = open(self.path, "a+")
+        deadline = time.time() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    self.f.close()
+                    raise CheckFailed(f"another apply/destroy/sweep/watch run holds {self.path}; "
+                                      "retry when it finishes")
+                time.sleep(0.5)
 
     def __exit__(self, *exc):
-        try:
-            os.remove(self.path)
-        except FileNotFoundError:
-            pass
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
 
 
 def _rows(result, what):
@@ -1014,7 +1023,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["check", "apply", "status", "logs", "pause", "resume", "sweep",
                                        "destroy", "rent-test", "watch"])
-    p.add_argument("--config", default=os.path.join(HERE, "config.toml"))
+    p.add_argument("--config", default=os.environ.get("ORCH_CONFIG") or os.path.join(HERE, "config.toml"))
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--min-age", type=float, default=900,

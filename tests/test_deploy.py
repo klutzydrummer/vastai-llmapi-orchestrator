@@ -17,6 +17,7 @@ import deploy  # noqa: E402
 deploy.POLL_S = 0
 deploy.CONFIRM_WAIT_S = 0
 deploy.DESTROY_WAIT_S = 0
+deploy.LOCK_WAIT_S = 0
 deploy.say = lambda msg="": None
 
 with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.example.toml"), "rb") as f:
@@ -295,9 +296,19 @@ def concurrent_runs_refused():
     """a second apply while one holds the lock is refused"""
     v = FakeVast()
     with deploy.StateLock():
-        raises(lambda: with_lock(lambda: apply(v)), deploy.CheckFailed, "another apply")
+        raises(lambda: with_lock(lambda: apply(v)), deploy.CheckFailed, "holds")
     assert not v.calls
     with_lock(lambda: apply(v))      # lock released afterwards
+
+
+@case
+def lock_freed_when_holder_dies():
+    """a run killed while holding the lock (e.g. a stopped container) doesn't block the next"""
+    import subprocess
+    code = ("import fcntl,os,sys; f=open(sys.argv[1],'a+'); "
+            "fcntl.flock(f,fcntl.LOCK_EX); os.kill(os.getpid(),9)")
+    subprocess.run([sys.executable, "-c", code, deploy.STATE_PATH + ".lock"])
+    with_lock(lambda: apply(FakeVast()))
 
 
 @case
