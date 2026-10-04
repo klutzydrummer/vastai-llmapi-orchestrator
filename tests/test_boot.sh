@@ -49,7 +49,7 @@ run_case(){
     pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; sleep 0.3
     env PATH="$WORK/bin:$PATH" ORCH_DIR="$orch" MODEL_LOG="$orch/model.log" \
         ORCH_SKIP_PYWORKER=1 ORCH_SKIP_APT=1 LLAMA_SERVER_BIN="$WORK/bin/llama-server" \
-        HF_ENDPOINT="http://127.0.0.1:$HF_PORT" MODELS_DIR="$WORK/models" \
+        HF_ENDPOINT="http://127.0.0.1:$HF_PORT" MODELS_DIR="$WORK/models" WORKSPACE_DIR="$WORK/workspace" \
         MODEL_REPO=test/repo MODEL_FILE=model.gguf MMPROJ_FILE=mmproj.gguf \
         SERVED_MODEL_NAME=testmodel BOOT_DEADLINE=60 "$@" \
         setsid bash "$orch/boot.sh" > "$orch/boot.out" 2>&1 &
@@ -184,7 +184,14 @@ HOLD=4 run_case "fatal with ORCH_FATAL_ACTION=none" fatal 30 "${SELF[@]}" ORCH_F
 
 # Serverless mode: a live PyWorker reports the error, so the worker is left to
 # the autoscaler; with no PyWorker running, the instance destroys itself.
-PYW=(ORCH_SKIP_PYWORKER=0 PYWORKER_RAW_BASE=http://127.0.0.1:1)
+# A local stand-in for the vast-ai/pyworker repo, so nothing is cloned from GitHub.
+FAKE_PYW="$WORK/fake-pyworker"
+git init -q "$FAKE_PYW" && echo stub > "$FAKE_PYW/README" \
+    && git -C "$FAKE_PYW" add README \
+    && git -C "$FAKE_PYW" -c user.name=t -c user.email=t@t commit -q -m stub
+FAKE_PYW_REF=$(git -C "$FAKE_PYW" rev-parse HEAD)
+PYW=(ORCH_SKIP_PYWORKER=0 PYWORKER_RAW_BASE=http://127.0.0.1:1
+     PYWORKER_REPO="$FAKE_PYW" PYWORKER_REF="$FAKE_PYW_REF")
 mkdir -p "$WORK/orch"
 printf 'exec sleep 300\n' > "$WORK/orch/start_server.sh"
 : > "$VAST_LOG"
@@ -194,6 +201,10 @@ HOLD=4 run_case "serverless failure with a live PyWorker" fatal 30 "${SELF[@]}" 
 grep -q "leaving this worker to the autoscaler" "$LAST_LOG" \
     && { echo "PASS  says why it left the worker alone"; PASS=$((PASS+1)); } \
     || { echo "FAIL  no log line for leaving the worker"; FAIL=$((FAIL+1)); }
+cmp -s "$REPO/worker/pyworker_worker.py" "$WORK/workspace/vast-pyworker/worker.py" \
+    && [ "$(git -C "$WORK/workspace/vast-pyworker" rev-parse HEAD)" = "$FAKE_PYW_REF" ] \
+    && { echo "PASS  our worker.py installed in the pyworker checkout at the pinned ref"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  pyworker checkout or worker.py missing"; FAIL=$((FAIL+1)); }
 
 printf 'exit 1\n' > "$WORK/orch/start_server.sh"
 : > "$VAST_LOG"
