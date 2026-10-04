@@ -621,5 +621,23 @@ def destroy_without_endpoint_still_cleans_recorded():
     assert [c[1] for c in v.made("destroy_instance")] == [4] and [i["id"] for i in v.instances] == [5]
 
 
+@case
+def missing_image_tag_suggests_newest_older_build():
+    """a llama.cpp release without an image points at the newest older build that has one"""
+    real = deploy._ghcr_token, deploy._ghcr_has
+    asked = []
+    deploy._ghcr_token = lambda name: "tok"
+    deploy._ghcr_has = lambda name, tag, tok: asked.append(tag) or tag == "server-cuda-b11371"
+    try:
+        alt = deploy.nearest_older_image("ghcr.io/ggml-org/llama.cpp:server-cuda-b11379")
+        assert alt == "ghcr.io/ggml-org/llama.cpp:server-cuda-b11371", alt
+        assert asked[0] == "server-cuda-b11378" and asked[-1] == "server-cuda-b11371", asked
+        assert deploy.nearest_older_image("ghcr.io/ggml-org/llama.cpp:server-cuda") is None
+        deploy._ghcr_has = lambda name, tag, tok: False
+        assert deploy.nearest_older_image("ghcr.io/x/y:server-cuda-b100", tries=5) is None
+    finally:
+        deploy._ghcr_token, deploy._ghcr_has = real
+
+
 print(f"---- {len(PASSED)} passed, {len(FAILED)} failed")
 sys.exit(1 if FAILED else 0)

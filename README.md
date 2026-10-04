@@ -135,6 +135,11 @@ docker compose build
 alias orch='docker compose run --rm deploy'        # orch check, orch apply, ...
 ```
 
+If `docker compose build` warns "Docker Compose is configured to build using
+Bake, but buildx isn't installed", it's harmless: compose falls back to the
+classic builder. Install the buildx plugin or set `COMPOSE_BAKE=false` to
+silence it.
+
 `deploy.py` keeps its record of what it created (`state.json`) in the
 `orch-state` volume, not in the checkout. Don't delete that volume while
 anything is deployed. To back it up:

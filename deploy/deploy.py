@@ -210,23 +210,51 @@ def gh_raw_exists(repo, sha, path):
     return r.status_code == 200
 
 
+MANIFEST_TYPES = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json"])
+
+
+def _ghcr_token(name):
+    return requests.get(f"https://ghcr.io/token?scope=repository:{name}:pull", timeout=20).json()["token"]
+
+
+def _ghcr_has(name, tag, tok):
+    r = requests.head(f"https://ghcr.io/v2/{name}/manifests/{tag}", timeout=20,
+                      headers={"Authorization": f"Bearer {tok}", "Accept": MANIFEST_TYPES})
+    return r.status_code == 200
+
+
 def image_exists(image):
     """True/False for ghcr.io images; None when the registry can't be checked."""
     if not image.startswith("ghcr.io/"):
         return None
     name, _, tag = image[len("ghcr.io/"):].rpartition(":")
     try:
-        tok = requests.get(f"https://ghcr.io/token?scope=repository:{name}:pull", timeout=20).json()["token"]
-        r = requests.head(f"https://ghcr.io/v2/{name}/manifests/{tag}", timeout=20, headers={
-            "Authorization": f"Bearer {tok}",
-            "Accept": ", ".join([
-                "application/vnd.oci.image.index.v1+json",
-                "application/vnd.docker.distribution.manifest.list.v2+json",
-                "application/vnd.oci.image.manifest.v1+json",
-                "application/vnd.docker.distribution.manifest.v2+json"])})
-        return r.status_code == 200
+        return _ghcr_has(name, tag, _ghcr_token(name))
     except Exception:
         return None
+
+
+def nearest_older_image(image, tries=40):
+    """For a missing ...-b<N> tag, the newest existing ...-b<M> with M < N.
+
+    llama.cpp publishes container images for only some release builds, so a
+    release number that exists on GitHub can still have no image."""
+    m = re.fullmatch(r"ghcr\.io/(.+):(.*-b)(\d+)", image)
+    if not m:
+        return None
+    name, prefix, n = m.group(1), m.group(2), int(m.group(3))
+    try:
+        tok = _ghcr_token(name)
+        for k in range(n - 1, max(n - 1 - tries, 0), -1):
+            if _ghcr_has(name, f"{prefix}{k}", tok):
+                return f"ghcr.io/{name}:{prefix}{k}"
+    except Exception:
+        pass
+    return None
 
 
 def vast():
@@ -301,8 +329,10 @@ def check(cfg, v=None):
     step(f"vast-ai/pyworker@{b['pyworker_ref'][:12]}", _pyworker)
     ok = image_exists(l["image"])
     if ok is False:
-        say(f"  FAIL  image {l['image']} not found")
-        problems.append(f"image {l['image']} not found")
+        alt = nearest_older_image(l["image"])
+        hint = f"; newest older build with an image: {alt}" if alt else ""
+        say(f"  FAIL  image {l['image']} not found{hint}")
+        problems.append(f"image {l['image']} not found{hint}")
     elif ok is None:
         say(f"  warn  could not verify image {l['image']}")
     else:
@@ -315,6 +345,9 @@ def check(cfg, v=None):
     step("docker options", _opts)
 
     say("offers matching workergroup.search_params")
+    if not re.search(r"\bcompute_cap\s*>=?\s*\d+", cfg["workergroup"]["search_params"]):
+        say("  warn  no compute_cap>= filter: old cards (Pascal P40, Volta V100) can be rented. "
+            "Add compute_cap>=750 (Turing and newer)")
     try:
         v = v or vast()
         offers = v.search_offers(query=cfg["workergroup"]["search_params"] + " rented=False",
@@ -326,7 +359,7 @@ def check(cfg, v=None):
             for o in offers[:8]:
                 say(f"  {o.get('gpu_name', '?'):<18} {o.get('gpu_ram', 0) / 1000:>5.0f} GB  "
                     f"${o.get('dph_total', 0):.3f}/hr  down {o.get('inet_down', 0):>6.0f} Mbps  "
-                    f"cuda {o.get('cuda_max_good', '?')}  rel {(o.get('reliability') or o.get('reliability2') or 0):.3f}")
+                    f"cuda {o.get('cuda_max_good', '?')}  cc {o.get('compute_cap', '?')}  rel {(o.get('reliability') or o.get('reliability2') or 0):.3f}")
     except SystemExit:
         raise
     except Exception as e:
