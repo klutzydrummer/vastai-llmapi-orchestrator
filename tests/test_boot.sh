@@ -144,5 +144,24 @@ HOLD=4 run_case "fatal with ORCH_FATAL_ACTION=none" fatal 30 "${SELF[@]}" ORCH_F
 [ -s "$VAST_LOG" ] && { echo "FAIL  ORCH_FATAL_ACTION=none still called the API"; FAIL=$((FAIL+1)); } \
     || { echo "PASS  ORCH_FATAL_ACTION=none leaves the instance alone"; PASS=$((PASS+1)); }
 
+# Serverless mode: a live PyWorker reports the error, so the worker is left to
+# the autoscaler; with no PyWorker running, the instance destroys itself.
+PYW=(ORCH_SKIP_PYWORKER=0 PYWORKER_RAW_BASE=http://127.0.0.1:1)
+mkdir -p "$WORK/orch"
+printf 'exec sleep 300\n' > "$WORK/orch/start_server.sh"
+: > "$VAST_LOG"
+HOLD=4 run_case "serverless failure with a live PyWorker" fatal 30 "${SELF[@]}" "${PYW[@]}" MODEL_FILE=nope.gguf
+[ -s "$VAST_LOG" ] && { echo "FAIL  destroyed a worker the PyWorker is reporting"; FAIL=$((FAIL+1)); } \
+    || { echo "PASS  live PyWorker: worker left to the autoscaler"; PASS=$((PASS+1)); }
+grep -q "leaving this worker to the autoscaler" "$LAST_LOG" \
+    && { echo "PASS  says why it left the worker alone"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  no log line for leaving the worker"; FAIL=$((FAIL+1)); }
+
+printf 'exit 1\n' > "$WORK/orch/start_server.sh"
+: > "$VAST_LOG"
+HOLD=4 run_case "serverless failure with a dead PyWorker" fatal 30 "${SELF[@]}" "${PYW[@]}" MODEL_FILE=nope.gguf
+expect_call "dead PyWorker: worker destroys itself (default action)" 'DELETE /api/v0/instances/4242/ Bearer inst-key'
+rm -f "$WORK/orch/start_server.sh"
+
 echo "---- $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

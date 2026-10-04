@@ -1,0 +1,18 @@
+# Watchdog for the Vast deployment: destroys workers Vast reports stuck
+# booting and recorded orphans, pauses the endpoint on overspend.
+# Copy to /etc/systemd/system/, adjust paths, then:
+#   systemctl enable --now orch-watch
+[Unit]
+Description=vastai-llmapi-orchestrator watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/vastai-llmapi-orchestrator
+EnvironmentFile=/etc/llmapi-shim.env
+ExecStart=/opt/vastai-llmapi-orchestrator/.venv/bin/python3 deploy/deploy.py watch --interval 60
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

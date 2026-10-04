@@ -43,19 +43,24 @@ export LD_LIBRARY_PATH="$(dirname "$LLAMA_SERVER_BIN")${LD_LIBRARY_PATH:+:$LD_LI
 log(){ echo "[$(date -u '+%H:%M:%S')] [boot] $*" | tee -a "$MODEL_LOG"; }
 
 # ── stop paying for a dead worker ─────────────────────────────────────────────
-# After ORCH_FATAL the PyWorker reports the error and the autoscaler should
-# drop this instance. If it is still running ORCH_FATAL_GRACE seconds later
-# (the PyWorker never came up, or this is a manual rental), the instance
-# stops or destroys itself with the instance-scoped key Vast injects.
+# After ORCH_FATAL a running PyWorker reports the error; Vast marks the worker
+# Error (not billed) and the autoscaler deals with it, so we leave it alone.
+# When nothing can report it (the PyWorker never started or died, or this is
+# a manual rental), the instance stops or destroys itself ORCH_FATAL_GRACE
+# seconds later. This is the in-container route Vast documents
+# (`vastai stop|destroy instance $CONTAINER_ID`, authorised by the per-instance
+# CONTAINER_API_KEY), done with curl against the same REST calls the CLI makes
+# because the llama.cpp image ships no vastai CLI.
 VAST_URL="${VAST_URL:-https://console.vast.ai}"
 ORCH_FATAL_GRACE="${ORCH_FATAL_GRACE:-600}"
 if [ "$ORCH_SKIP_PYWORKER" = "1" ]; then _default_action=stop; else _default_action=destroy; fi
 ORCH_FATAL_ACTION="${ORCH_FATAL_ACTION:-$_default_action}"   # destroy | stop | none
 ORCH_MANUAL_TTL="${ORCH_MANUAL_TTL:-14400}"   # manual rental stops itself after this many seconds; 0 = never
 CLEANUP_MARK="$ORCH_DIR/.cleanup-scheduled"
+PYWORKER_PIDFILE="$ORCH_DIR/pyworker.pid"
 
 self_terminate(){   # $1 = destroy|stop, $2 = why
-    local action="$1" why="$2" url code i
+    local action="$1" why="$2" url code body i
     if [ -z "${CONTAINER_ID:-}" ] || [ -z "${CONTAINER_API_KEY:-}" ]; then
         log "warn: $why, but CONTAINER_ID/CONTAINER_API_KEY are unset; can't $action this instance"
         return 1
@@ -63,16 +68,21 @@ self_terminate(){   # $1 = destroy|stop, $2 = why
     url="$VAST_URL/api/v0/instances/$CONTAINER_ID/"
     log "$why: asking Vast to $action instance $CONTAINER_ID"
     for i in 1 2 3; do
+        body="$ORCH_DIR/self_terminate.resp"
         if [ "$action" = destroy ]; then
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE \
+            code=$(curl -s -o "$body" -w '%{http_code}' --max-time 30 -X DELETE \
                 -H "Authorization: Bearer $CONTAINER_API_KEY" -H 'Content-Type: application/json' -d '{}' "$url")
         else
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X PUT \
+            code=$(curl -s -o "$body" -w '%{http_code}' --max-time 30 -X PUT \
                 -H "Authorization: Bearer $CONTAINER_API_KEY" -H 'Content-Type: application/json' \
                 -d '{"state":"stopped"}' "$url")
         fi
-        case "$code" in 2*) log "instance $CONTAINER_ID: $action accepted"; return 0;; esac
-        log "warn: $action returned HTTP $code (attempt $i)"
+        # Vast answers {"success": true, ...}; a 200 with success false is a refusal.
+        if [ "${code:0:1}" = 2 ] && ! grep -Eq '"success" *: *false' "$body" 2>/dev/null; then
+            log "instance $CONTAINER_ID: $action accepted"
+            return 0
+        fi
+        log "warn: $action returned HTTP $code: $(head -c 300 "$body" 2>/dev/null) (attempt $i)"
         sleep $((i * 10))
     done
     return 1
@@ -85,6 +95,11 @@ schedule_fatal_cleanup(){
         sleep "$ORCH_FATAL_GRACE"
         # A new boot rewrites the state file; only act on this boot's failure.
         [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] || exit 0
+        pid=$(cat "$PYWORKER_PIDFILE" 2>/dev/null)
+        if [ "$ORCH_SKIP_PYWORKER" != "1" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log "PyWorker is running and reports the error; leaving this worker to the autoscaler"
+            exit 0
+        fi
         self_terminate "$ORCH_FATAL_ACTION" "still running ${ORCH_FATAL_GRACE}s after $FATAL_MARK"
     ) </dev/null >/dev/null 2>&1 &
 }
@@ -105,6 +120,7 @@ fatal(){
 : > "$MODEL_LOG"
 echo "booting" > "$STATE_FILE"
 rmdir "$CLEANUP_MARK" 2>/dev/null
+rm -f "$PYWORKER_PIDFILE"
 log "boot start (orch ref ${ORCH_REF:-unknown})"
 
 # ── manual rentals don't run forever ──────────────────────────────────────────
@@ -168,7 +184,8 @@ failed to load model"
     export SDK_VERSION="$VAST_SDK_VERSION"
     export WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
     ss="$ORCH_DIR/start_server.sh"
-    raw="https://raw.githubusercontent.com/${PYWORKER_REPO#https://github.com/}/$PYWORKER_REF/start_server.sh"
+    raw_base="${PYWORKER_RAW_BASE:-https://raw.githubusercontent.com/${PYWORKER_REPO#https://github.com/}}"
+    raw="$raw_base/$PYWORKER_REF/start_server.sh"
     if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "$raw" -o "$ss.new"; then
         [ -s "$ss" ] || fatal "could not download pyworker start_server.sh ($raw)"
         log "warn: using cached start_server.sh"
@@ -177,6 +194,7 @@ failed to load model"
     fi
     log "starting pyworker (ref ${PYWORKER_REF:0:12}, sdk $VAST_SDK_VERSION)"
     nohup bash "$ss" > "$ORCH_DIR/pyworker-boot.log" 2>&1 &
+    echo $! > "$PYWORKER_PIDFILE"
 else
     log "ORCH_SKIP_PYWORKER=1: manual mode, no serverless worker"
 fi

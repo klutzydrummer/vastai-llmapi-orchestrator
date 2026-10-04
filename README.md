@@ -31,19 +31,23 @@ the autoscaler drops that worker instead of billing for it.
 | smoke test | `/props` reports vision on; a text request and a **real image request** both return text | fatal |
 | deadline | whole boot finishes within `deadline_s` | fatal |
 | serving | `llama-server` exits later | fatal |
-| after fatal | instance still running `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
+| after fatal | no PyWorker left to report it, `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
 
 Everything remote is pinned when you deploy: model revisions, this repo's
 commit, the llama.cpp image build, the PyWorker commit and the Vast SDK
 version. A cold worker that restarts finds its verified weights on disk and
 skips the download (size + marker check, no re-hash).
 
-After a fatal error the PyWorker should get the worker dropped. If the
-instance is still up `ORCH_FATAL_GRACE` seconds later (the PyWorker never
-started, or it's a manual rental), it destroys itself through the Vast API
-with the instance-scoped `CONTAINER_API_KEY` Vast injects. Manual rentals stop
-instead, so the logs stay on disk. Set `ORCH_FATAL_ACTION=none` to turn this
-off.
+After a fatal error a running PyWorker reports it; Vast marks the worker
+Error, which isn't billed, and the autoscaler handles it, so the worker is
+left alone (and `deploy.py watch`, below, destroys any worker Vast still
+reports as booting long past the deadline). When nothing can report the error
+(the PyWorker never started or died), the instance destroys itself `ORCH_FATAL_GRACE` seconds later. This is
+Vast's documented in-container route, `vastai destroy instance $CONTAINER_ID`
+authorised by the per-instance `CONTAINER_API_KEY`, made as the same REST
+call with curl because the llama.cpp image has no `vastai` CLI. Manual
+rentals stop instead, so the logs stay on disk (stopped instances still pay
+for storage). Set `ORCH_FATAL_ACTION=none` to turn this off.
 
 ## Spend limits
 
@@ -56,22 +60,53 @@ config that leaves any of them out, has no `dph_total<=` ceiling, or whose
 worst case `(max_workers + test_workers) x ceiling` exceeds
 `[limits] max_hourly_usd`.
 
-## Duplicates and orphans
+## No guessing with money
 
-- `apply` treats any error or odd answer from the Vast API as a stop, never as
-  "nothing exists". It refuses when two endpoints share the name, when the
-  endpoint has more than one workergroup, or when the endpoint recorded in
-  `deploy/state.json` was renamed. It records each endpoint and workergroup in
-  `state.json` before creating it, so a re-run after a crash refuses instead of
-  creating a second one. A lock file stops two runs racing.
-- Every instance carries `ORCH_DEPLOYMENT=<endpoint name>`. `deploy.py status`
-  lists them with their hourly cost and flags orphans: marked instances older
-  than `--min-age` (15 min) that the autoscaler doesn't count as workers.
-  `deploy.py sweep` destroys orphans after asking, and waits until Vast no
-  longer lists them. It destroys nothing if the autoscaler can't list its
-  workers. Instances without the marker are listed but never touched.
-- Deleting a workergroup doesn't destroy its instances, so `destroy` destroys
-  them itself and waits until they're gone. It exits non-zero if any survive.
+Every decision that creates or destroys something paid rests on what Vast
+itself reports, never on an inference:
+
+- **Ownership comes from Vast's answers.** Serverless workers are the ids the
+  autoscaler lists for the endpoint (`get_endpoint_workers`). Test rentals are
+  made by `deploy.py rent-test`, which records the instance id Vast returns.
+  Both go into `deploy/state.json`. Anything else on the account is
+  "unrecorded": `status` shows it with its cost, and only
+  `sweep --destroy ID` removes it.
+- **Every write is read back.** After creating or updating the endpoint or
+  workergroup, and after `pause`/`resume`, `deploy.py` re-reads it and fails
+  if Vast reports a different `max_workers`, `cold_workers`, `min_load`,
+  state or template than it asked for. A field Vast doesn't report is named
+  as unconfirmed, not assumed. `pause`/`resume` send every configured limit
+  with the new state, so nothing depends on how Vast treats omitted fields.
+- **Any API error or odd answer stops the run**, never reads as "nothing
+  exists". `apply` refuses duplicate endpoints, more than one workergroup, or
+  an endpoint renamed since `state.json` recorded it; it records each creation
+  as pending first, so a re-run after a crash refuses instead of creating a
+  second one; a lock file stops two runs racing.
+- **Orphans** are instances `state.json` recorded as ours that Vast still
+  lists but that are no longer workers (for `--min-age`, 15 min) or are test
+  rentals past `limits.manual_ttl_s`. `sweep` destroys them after asking and
+  waits until Vast no longer lists them. If the autoscaler can't list its
+  workers, it destroys nothing.
+- **`destroy`** deletes the endpoint, which per Vast's API also deletes its
+  workergroups and destroys their workers (it reports any it couldn't). It
+  then destroys every recorded instance Vast still lists and waits until
+  they're gone, exiting non-zero if any survive.
+- **`deploy.py watch`** runs at home next to the shim (see
+  `deploy/orch-watch.service`). Every minute it destroys workers Vast still
+  reports as booting (`CREATING`/`LOADING`/`STARTING`…, all billed) more than
+  `boot.deadline_s + limits.stuck_grace_s` after it first saw them, destroys
+  recorded orphans, and pauses the endpoint if the account's running $/hr, as
+  Vast reports it, exceeds `limits.max_hourly_usd`. Worker statuses it doesn't
+  recognise and unrecorded instances are reported, never acted on.
+- `apply` creates the workergroup with every limit set explicitly
+  (`test_workers`, `cold_workers`, `max_workers`, `min_load`): the REST API
+  accepts them per workergroup with defaults of 3 / 3 / 20 / 1, but the SDK's
+  `create_workergroup` doesn't pass them, so that one call goes to the API
+  directly.
+
+Not documented by Vast, so not relied on: what `endpoint_state=stopped` does
+beyond being the CLI's documented pause value, and whether every field is
+echoed back by `show_workergroups` (unconfirmed ones are printed).
 
 ## Layout
 
@@ -81,7 +116,8 @@ worker/boot.sh          the boot sequence above
 worker/fetch_model.py   Hub lookup, resumable download (aria2c, curl fallback), sha256 verify
 worker/smoke_test.py    /props + text + image checks
 shim/shim.py            OpenAI-compatible proxy (vastai SDK client)
-deploy/deploy.py        preflight, then template / endpoint / workergroup
+deploy/deploy.py        preflight, template / endpoint / workergroup, rent-test, sweep, watch, destroy
+deploy/orch-watch.service  systemd unit for `deploy.py watch`
 tests/                  fakes for the Hub, GPU, llama-server, autoscaler and worker
 ```
 
@@ -96,11 +132,13 @@ export VAST_API_KEY=...
 cp deploy/config.example.toml deploy/config.toml
 ```
 
-### 1. Prove it on one manual rental first (recommended)
+### 1. Prove it on one test rental first (recommended)
 
-Rent a single instance by hand with the image from `config.toml`, the docker
-options that `deploy.py apply --dry-run` prints, `-e ORCH_SKIP_PYWORKER=1`
-added, and `worker/onstart.sh` as the on-start script. Then:
+```bash
+python3 deploy/deploy.py rent-test        # cheapest matching offer, no serverless; records the id
+```
+
+Then, on the instance (`vastai ssh-url <id>`):
 
 ```bash
 tail -f /workspace/orch/model.log      # wait for ORCH_READY (or ORCH_FATAL with the reason)
@@ -108,9 +146,9 @@ curl -s localhost:18000/v1/chat/completions -H 'Content-Type: application/json' 
   -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":50}'
 ```
 
-Destroy it when you're happy. That run is the reference for everything after.
-A manual rental stops itself after `ORCH_MANUAL_TTL` seconds (default 4 hours;
-`-e ORCH_MANUAL_TTL=0` to disable), and `deploy.py sweep` finds one you forgot.
+That run is the reference for everything after. Remove it with
+`deploy.py destroy` or `sweep --destroy <id>`. It stops itself after
+`limits.manual_ttl_s` (4 hours), after which `sweep` and `watch` destroy it.
 
 ### 2. Deploy
 
@@ -123,7 +161,8 @@ python3 deploy/deploy.py status           # first worker: download, load, smoke 
 
 `check` must pass before `apply` changes anything. `deploy/state.json` records
 what was created; keep it. Other commands: `logs`, `pause` (workers go inactive,
-storage cost only), `resume`, `sweep` (destroy orphaned instances), `destroy`.
+storage cost only), `resume`, `sweep` (destroy orphaned instances), `destroy`,
+`watch` (the watchdog; run it as a service next to the shim).
 
 The repo must be public, and the commit you deploy must be pushed: workers
 fetch their scripts from `raw.githubusercontent.com` at that commit. For gated
@@ -179,5 +218,5 @@ tests/run_all.sh
 These run the real `boot.sh` against a fake Hub, fake GPU, fake llama-server
 and fake Vast API through every failure mode, run the real shim with the real
 vastai SDK client against a fake autoscaler and worker, and run `deploy.py`'s
-apply, sweep, destroy and spend checks against an in-memory fake of the Vast
-API.
+apply, read-back verification, rent-test, sweep, watch, destroy and spend
+checks against an in-memory fake of the Vast API.

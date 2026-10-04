@@ -7,6 +7,7 @@ import copy
 import os
 import sys
 import tempfile
+import time
 import tomllib
 import types
 
@@ -36,11 +37,17 @@ class Resp:
 
 
 class FakeVast:
+    """In-memory Vast: endpoints and workergroups keep the fields they were
+    given (so read-back verification has something to compare), workers are
+    the autoscaler's list, instances are the account's instances."""
+
     def __init__(self):
-        self.endpoints, self.groups, self.instances, self.workers = [], [], [], []
+        self.endpoints, self.groups, self.instances = [], [], []
+        self.workers = {}          # instance id -> autoscaler status
         self.calls = []
         self.fail = set()          # method names that answer with an error dict
         self.sticky = set()        # instance ids that survive destroy
+        self.ignore = set()        # endpoint fields the "server" silently ignores
         self.next_id = 100
         self.client = types.SimpleNamespace(post=self._post)
 
@@ -63,49 +70,79 @@ class FakeVast:
     def get_endpoint_workers(self, id):
         if "get_endpoint_workers" in self.fail:
             return {"error_msg": "not ready"}
-        return [{"id": i} for i in self.workers]
+        return [{"id": i, "status": s} for i, s in self.workers.items()]
 
     def create_template(self, **kw):
         self.calls.append(("create_template",))
         return {"success": True, "template": {"hash_id": f"tpl{self._id()}"}}
 
+    def _apply_fields(self, row, kw):
+        for k, val in kw.items():
+            if val is not None and k not in self.ignore:
+                row[k] = val
+
     def create_endpoint(self, **kw):
         self.calls.append(("create_endpoint", kw))
         eid = self._id()
-        self.endpoints.append({"id": eid, "endpoint_name": kw["endpoint_name"]})
+        row = {"id": eid, "endpoint_state": "active"}
+        self._apply_fields(row, kw)
+        self.endpoints.append(row)
         return {"success": True, "result": eid}
 
     def update_endpoint(self, id, **kw):
         self.calls.append(("update_endpoint", id, kw))
+        for row in self.endpoints:
+            if row["id"] == id:
+                self._apply_fields(row, kw)
 
     def update_workergroup(self, id, **kw):
         self.calls.append(("update_workergroup", id, kw))
+        for g in self.groups:
+            if g["id"] == id and kw.get("template_hash"):
+                g["template_hash"] = kw["template_hash"]
 
     def _post(self, path, json_data=None):
         self.calls.append(("create_workergroup", json_data))
-        self.groups.append({"id": self._id(), "endpoint_id": json_data["endpoint_id"]})
-        return Resp({"success": True})
+        gid = self._id()
+        self.groups.append({"id": gid, **{k: json_data[k] for k in (
+            "endpoint_id", "template_hash", "test_workers", "cold_workers", "max_workers", "min_load")}})
+        return Resp({"success": True, "id": gid})
 
     def delete_workergroup(self, id):
         self.calls.append(("delete_workergroup", id))
         self.groups = [g for g in self.groups if g["id"] != id]
 
     def delete_endpoint(self, id):
+        """Like Vast: deletes the endpoint's workergroups and destroys its workers."""
         self.calls.append(("delete_endpoint", id))
         self.endpoints = [e for e in self.endpoints if e["id"] != id]
+        self.groups = [g for g in self.groups if g["endpoint_id"] != id]
+        gone = [i for i in self.workers if i not in self.sticky]
+        failed = [i for i in self.workers if i in self.sticky]
+        self.instances = [i for i in self.instances if i["id"] not in gone]
+        self.workers = {}
+        return {"success": True, "deleted_workers": gone, "failed_workers": failed}
 
     def destroy_instance(self, id):
         self.calls.append(("destroy_instance", id))
         if id not in self.sticky:
             self.instances = [i for i in self.instances if i["id"] != id]
 
+    def search_offers(self, **kw):
+        return [{"id": 777, "gpu_name": "RTX 4090", "dph_total": 0.31}]
+
+    def create_instance(self, offer, **kw):
+        self.calls.append(("create_instance", offer, kw))
+        iid = self._id()
+        self.instances.append(inst(iid, label=kw.get("label")))
+        return {"success": True, "new_contract": iid}
+
     def made(self, name):
         return [c for c in self.calls if c[0] == name]
 
 
-def inst(id, age=3600, env=None, dph=0.3):
-    return {"id": id, "duration": age, "dph_total": dph, "actual_status": "running", "gpu_name": "RTX 4090",
-            "extra_env": {"ORCH_DEPLOYMENT": NAME, **(env or {})} if env is not False else {}}
+def inst(id, status="running", dph=0.3, label=None):
+    return {"id": id, "actual_status": status, "dph_total": dph, "gpu_name": "RTX 4090", "label": label}
 
 
 PASSED, FAILED = [], []
@@ -125,7 +162,7 @@ def case(fn):
 
 
 def args(**kw):
-    a = {"yes": True, "dry_run": False, "min_age": 900}
+    a = {"yes": True, "dry_run": False, "min_age": 900, "destroy": []}
     a.update(kw)
     return types.SimpleNamespace(**a)
 
@@ -161,6 +198,23 @@ def fresh_apply_then_reapply():
     st = deploy.load_state()
     assert st["endpoint_id"] == v.endpoints[0]["id"] and st["workergroup_id"] == v.groups[0]["id"], st
     assert "endpoint_pending" not in st and "workergroup_pending" not in st, st
+
+
+@case
+def workergroup_calls_match_the_sdk():
+    """update passes the raw search (the SDK adds defaults); create sends every limit"""
+    v = FakeVast()
+    apply(v)
+    blob = v.made("create_workergroup")[0][1]
+    e, w = BASE_CFG["endpoint"], BASE_CFG["workergroup"]
+    for k, want in (("max_workers", e["max_workers"]), ("min_load", e["min_load"]),
+                    ("cold_workers", e["cold_workers"]), ("test_workers", w["test_workers"])):
+        assert blob[k] == want, (k, blob)
+    assert blob["search_params"].endswith("verified=True rentable=True rented=False")
+    assert deploy.load_state()["workergroup_id"] == v.groups[0]["id"]
+    apply(v)
+    upd = v.made("update_workergroup")[0][2]
+    assert upd["search_params"] == w["search_params"], upd
 
 
 @case
@@ -298,7 +352,6 @@ def worst_case_over_budget_refused():
     raises(lambda: deploy.check_limits(limited(endpoint__max_workers=3)), text="max_workers_cap")
 
 
-# ── sweep ─────────────────────────────────────────────────────────────────────
 def deployed():
     v = FakeVast()
     apply(v)
@@ -306,18 +359,93 @@ def deployed():
     return v
 
 
+def seen(v, *ids, ago=3600):
+    """Make state.json record ids as workers first seen `ago` seconds back."""
+    st = deploy.load_state()
+    for i in ids:
+        st.setdefault("seen_workers", {})[str(i)] = time.time() - ago
+    deploy.save_state(st)
+
+
+# ── verify after write ────────────────────────────────────────────────────────
 @case
-def sweep_destroys_only_orphans():
-    """sweep destroys old marked instances the autoscaler doesn't count, nothing else"""
+def ignored_setting_is_caught():
+    """if Vast reports a different max_workers than asked, apply fails instead of trusting it"""
+    v = FakeVast()
+    real = v.create_endpoint
+
+    def create(**kw):
+        res = real(**kw)
+        v.endpoints[-1]["max_workers"] = 20      # server kept its default
+        return res
+    v.create_endpoint = create
+    v.ignore.add("max_workers")
+    raises(lambda: apply(v), deploy.ApiError, "max_workers: asked 1, Vast reports 20")
+
+
+@case
+def unreported_fields_are_named_not_assumed():
+    """a field Vast doesn't report back is listed as unconfirmed"""
+    msgs = []
+    deploy.say = msgs.append
+    try:
+        missing = deploy._verify({"id": 1, "max_workers": 1}, {"max_workers": 1, "test_workers": 1}, "wg 1")
+    finally:
+        deploy.say = lambda msg="": None
+    assert missing == ["test_workers"] and any("can't confirm" in m for m in msgs), msgs
+
+
+@case
+def pause_sends_every_limit_and_verifies():
+    """pause sends the configured limits with the state and reads it back"""
     v = deployed()
-    v.instances = [inst(1), inst(2), inst(3, age=60), inst(4, env=False),
-                   inst(5, env={"ORCH_SKIP_PYWORKER": "1"})]
-    v.workers = [1]
+    deploy.vast = lambda: v
+    deploy._set_state(BASE_CFG, "stopped")
+    kw = v.made("update_endpoint")[-1][2]
+    assert kw["endpoint_state"] == "stopped" and kw["max_workers"] == BASE_CFG["endpoint"]["max_workers"], kw
+    assert v.endpoints[0]["endpoint_state"] == "stopped"
+    v.ignore.add("endpoint_state")
+    raises(lambda: deploy._set_state(BASE_CFG, "active"), deploy.ApiError, "endpoint_state")
+
+
+# ── sweep: facts only ────────────────────────────────────────────────────────
+@case
+def sweep_destroys_only_recorded_orphans():
+    """sweep destroys former workers it recorded, never unrecorded instances"""
+    v = deployed()
+    v.instances = [inst(1), inst(2), inst(3), inst(4)]
+    v.workers = {1: "IDLE"}
+    seen(v, 1, 2)
+    seen(v, 3, ago=60)                 # recorded only a minute ago
     deploy.vast = lambda: v
     deploy.cmd_sweep(BASE_CFG, args())
-    destroyed = sorted(c[1] for c in v.made("destroy_instance"))
-    assert destroyed == [2, 5], destroyed
+    assert [c[1] for c in v.made("destroy_instance")] == [2], v.calls
     assert sorted(i["id"] for i in v.instances) == [1, 3, 4]
+
+
+@case
+def sweep_records_workers_it_sees():
+    """sweep records every worker id the autoscaler reports"""
+    v = deployed()
+    v.instances = [inst(5)]
+    v.workers = {5: "LOADING"}
+    deploy.vast = lambda: v
+    deploy.cmd_sweep(BASE_CFG, args())
+    assert "5" in deploy.load_state()["seen_workers"] and not v.made("destroy_instance")
+
+
+@case
+def sweep_destroy_named_unrecorded():
+    """an unrecorded instance is destroyed only when named, and a live worker never"""
+    v = deployed()
+    v.instances = [inst(1), inst(9)]
+    v.workers = {1: "IDLE"}
+    deploy.vast = lambda: v
+    deploy.cmd_sweep(BASE_CFG, args())
+    assert not v.made("destroy_instance")
+    deploy.cmd_sweep(BASE_CFG, args(destroy=[9]))
+    assert [c[1] for c in v.made("destroy_instance")] == [9]
+    raises(lambda: deploy.cmd_sweep(BASE_CFG, args(destroy=[1])), text="live worker")
 
 
 @case
@@ -325,6 +453,7 @@ def sweep_dry_run_destroys_nothing():
     """sweep --dry-run only reports"""
     v = deployed()
     v.instances = [inst(2)]
+    seen(v, 2)
     deploy.vast = lambda: v
     deploy.cmd_sweep(BASE_CFG, args(dry_run=True))
     assert not v.made("destroy_instance")
@@ -334,7 +463,8 @@ def sweep_dry_run_destroys_nothing():
 def sweep_refuses_without_worker_list():
     """if the autoscaler can't list workers, sweep destroys nothing"""
     v = deployed()
-    v.instances = [inst(1), inst(2)]
+    v.instances = [inst(2)]
+    seen(v, 2)
     v.fail.add("get_endpoint_workers")
     deploy.vast = lambda: v
     raises(lambda: deploy.cmd_sweep(BASE_CFG, args()), deploy.ApiError)
@@ -342,49 +472,121 @@ def sweep_refuses_without_worker_list():
 
 
 @case
-def sweep_without_endpoint_treats_all_as_orphans():
-    """with no endpoint left, every marked instance is an orphan"""
-    v = FakeVast()
-    v.instances = [inst(7), inst(8, env=False)]
-    deploy.vast = lambda: v
-    deploy.cmd_sweep(BASE_CFG, args())
-    assert [c[1] for c in v.made("destroy_instance")] == [7]
-
-
-@case
 def sweep_reports_survivors():
     """an instance that won't go away makes sweep fail loudly"""
     v = deployed()
     v.instances = [inst(2)]
+    seen(v, 2)
     v.sticky.add(2)
     deploy.vast = lambda: v
     raises(lambda: deploy.cmd_sweep(BASE_CFG, args()), deploy.CheckFailed, "still exist")
 
 
+# ── rent-test ────────────────────────────────────────────────────────────────
 @case
-def legacy_and_template_ownership():
-    """instances without the marker are recognised by old env vars or a recorded template"""
-    st = {"template_hashes": ["tplX"]}
-    legacy = {"id": 1, "extra_env": [["ORCH_REF", "abc"], ["SERVED_MODEL_NAME", BASE_CFG["model"]["served_name"]]]}
-    by_tpl = {"id": 2, "template_hash_id": "tplX", "extra_env": {}}
-    stranger = {"id": 3, "extra_env": {"ORCH_REF": "abc", "SERVED_MODEL_NAME": "other"}}
-    assert deploy.owned(legacy, BASE_CFG, st) and deploy.owned(by_tpl, BASE_CFG, st)
-    assert not deploy.owned(stranger, BASE_CFG, st)
+def rent_test_records_the_id_vast_returns():
+    """rent-test records the instance id from Vast; past its TTL it becomes an orphan"""
+    v = FakeVast()
+    deploy.vast = lambda: v
+    real_check = deploy.check
+    deploy.check = lambda cfg, v=None: PINS
+    try:
+        deploy.cmd_rent_test(BASE_CFG, args())
+    finally:
+        deploy.check = real_check
+    (_, offer, kw), = v.made("create_instance")
+    assert offer == 777 and "ORCH_SKIP_PYWORKER=1" in kw["env"] and kw["cancel_unavail"], kw
+    iid = v.instances[0]["id"]
+    st = deploy.load_state()
+    assert str(iid) in st["manual_instances"], st
+    r = deploy.survey(v, BASE_CFG, st, None, 900)
+    assert [i["id"] for i in r["manual"]] == [iid]
+    r = deploy.survey(v, BASE_CFG, st, None, 900, now=time.time() + 14401)
+    assert [i["id"] for i in r["orphans"]] == [iid]
+
+
+# ── watch ────────────────────────────────────────────────────────────────────
+def tick(v, now=None):
+    st = deploy.load_state()
+    out = deploy.watch_tick(v, BASE_CFG, st, now)
+    deploy.save_state(st)
+    return out
+
+
+@case
+def watch_destroys_worker_stuck_booting():
+    """a worker Vast reports loading past the boot deadline is destroyed; idle and error ones are not"""
+    v = deployed()
+    v.instances = [inst(1, dph=0.1), inst(2, dph=0.1), inst(3, dph=0.1)]
+    v.workers = {1: "LOADING", 2: "IDLE", 3: "ERROR"}
+    t0 = time.time()
+    assert not tick(v, t0)
+    limit = BASE_CFG["boot"]["deadline_s"] + BASE_CFG["limits"]["stuck_grace_s"]
+    acts = tick(v, t0 + limit + 1)
+    assert [c[1] for c in v.made("destroy_instance")] == [1], (acts, v.calls)
+
+
+@case
+def watch_ignores_unknown_status():
+    """a status string the watchdog doesn't know is left alone"""
+    v = deployed()
+    v.instances = [inst(1)]
+    v.workers = {1: "SOMETHING_NEW"}
+    t0 = time.time()
+    tick(v, t0)
+    tick(v, t0 + 10 ** 6)
+    assert not v.made("destroy_instance")
+
+
+@case
+def watch_pauses_on_overspend():
+    """account burn over max_hourly_usd pauses the endpoint, read back; unrecorded instances untouched"""
+    v = deployed()
+    v.instances = [inst(1, dph=0.5), inst(9, dph=0.5)]
+    v.workers = {1: "IDLE"}
+    acts = tick(v)
+    assert any("paused" in a for a in acts), acts
+    assert v.endpoints[0]["endpoint_state"] == "stopped"
+    assert not v.made("destroy_instance")
+
+
+@case
+def watch_within_budget_does_nothing():
+    """under budget with healthy workers, the watchdog changes nothing"""
+    v = deployed()
+    v.instances = [inst(1, dph=0.3)]
+    v.workers = {1: "IDLE"}
+    assert not tick(v) and not v.made("update_endpoint") and not v.made("destroy_instance")
 
 
 # ── destroy ───────────────────────────────────────────────────────────────────
 @case
-def destroy_removes_instances_and_confirms():
-    """destroy deletes group + endpoint, then destroys and confirms every instance"""
+def destroy_removes_recorded_instances_and_confirms():
+    """destroy deletes the endpoint (Vast takes its workers), then destroys recorded leftovers"""
     v = deployed()
-    v.instances = [inst(1), inst(2, age=10), inst(9, env=False)]
-    v.workers = [1]
+    v.instances = [inst(1), inst(2), inst(9)]
+    v.workers = {1: "IDLE"}
+    seen(v, 2)
     deploy.vast = lambda: v
     deploy.cmd_destroy(BASE_CFG, args())
-    assert v.made("delete_workergroup") and v.made("delete_endpoint")
-    assert sorted(c[1] for c in v.made("destroy_instance")) == [1, 2]
+    assert v.made("delete_endpoint") and not v.made("delete_workergroup"), v.calls
+    assert not v.groups
+    assert sorted(c[1] for c in v.made("destroy_instance")) == [2]
     assert [i["id"] for i in v.instances] == [9]
-    assert "endpoint_id" not in deploy.load_state()
+    st = deploy.load_state()
+    assert "endpoint_id" not in st and not st["seen_workers"]
+
+
+@case
+def destroy_retries_failed_workers():
+    """workers Vast reports as failed to delete are destroyed, and survivors reported"""
+    v = deployed()
+    v.instances = [inst(1)]
+    v.workers = {1: "IDLE"}
+    v.sticky.add(1)
+    deploy.vast = lambda: v
+    raises(lambda: deploy.cmd_destroy(BASE_CFG, args()), deploy.CheckFailed, "still exist")
+    assert ("destroy_instance", 1) in v.calls
 
 
 @case
@@ -398,30 +600,14 @@ def destroy_follows_renamed_endpoint():
 
 
 @case
-def destroy_without_endpoint_still_cleans_instances():
-    """endpoint already gone: destroy still destroys leftover instances"""
+def destroy_without_endpoint_still_cleans_recorded():
+    """endpoint already gone: destroy still destroys recorded instances, not others"""
     v = FakeVast()
-    v.instances = [inst(4)]
+    v.instances = [inst(4), inst(5)]
+    seen(v, 4)
     deploy.vast = lambda: v
     deploy.cmd_destroy(BASE_CFG, args())
-    assert [c[1] for c in v.made("destroy_instance")] == [4] and not v.instances
-
-
-@case
-def destroy_reports_survivors():
-    """an instance that survives destroy is reported, and state is kept"""
-    v = deployed()
-    v.instances = [inst(1)]
-    v.sticky.add(1)
-    deploy.vast = lambda: v
-    raises(lambda: deploy.cmd_destroy(BASE_CFG, args()), deploy.CheckFailed, "still exist")
-    assert deploy.load_state().get("endpoint_id")
-
-
-@case
-def docker_options_carry_marker():
-    """the template env carries the ORCH_DEPLOYMENT ownership marker"""
-    assert f"-e ORCH_DEPLOYMENT={NAME}" in deploy.docker_options(BASE_CFG, PINS)
+    assert [c[1] for c in v.made("destroy_instance")] == [4] and [i["id"] for i in v.instances] == [5]
 
 
 print(f"---- {len(PASSED)} passed, {len(FAILED)} failed")
