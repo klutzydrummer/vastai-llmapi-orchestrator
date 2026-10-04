@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Tiny stand-in for the Hugging Face Hub: paths-info + resolve (with Range).
 
-Usage: fake_hf.py PORT DIR [--corrupt NAME] [--slow SECS]
+Usage: fake_hf.py PORT DIR [--corrupt NAME] [--slow SECS] [--stall-once]
 Every file in DIR is served as repo "test/repo". With --corrupt NAME the Hub
 reports a wrong sha256 for that file, to exercise verification failure. With
---slow SECS each download is spread over about SECS seconds.
+--slow SECS each download is spread over about SECS seconds. With
+--stall-once the first download sends half the file, then hangs.
 """
 import hashlib
 import json
@@ -17,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT, ROOT = int(sys.argv[1]), sys.argv[2]
 CORRUPT = sys.argv[sys.argv.index("--corrupt") + 1] if "--corrupt" in sys.argv else None
 SLOW = float(sys.argv[sys.argv.index("--slow") + 1]) if "--slow" in sys.argv else 0
+STALL = {"left": 1 if "--stall-once" in sys.argv else 0}
 
 
 def info(name):
@@ -69,6 +71,12 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data) - start))
         self.end_headers()
         body = data[start:]
+        if STALL["left"]:
+            STALL["left"] -= 1
+            self.wfile.write(body[:len(body) // 2])
+            self.wfile.flush()
+            time.sleep(600)
+            return
         if not SLOW:
             self.wfile.write(body)
             return

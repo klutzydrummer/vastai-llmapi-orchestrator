@@ -30,11 +30,11 @@ the autoscaler drops that worker instead of billing for it.
 | Stage | Check | On failure |
 | --- | --- | --- |
 | before download | `nvidia-smi` shows ≥ `min_vram_gb`; `llama-server --list-devices` sees CUDA (catches driver/image mismatch) | fatal, nothing downloaded |
-| download | file exists at the **pinned commit** on the Hub; enough disk | fatal |
+| download | file exists at the **pinned commit** on the Hub; enough disk; average speed ≥ `download_min_mbps` after 90 s; all files within `download_max_s` | fatal (a download with no data for 2 minutes is restarted first) |
 | verify | size + **sha256 match the Hub's LFS hash**; GGUF magic bytes | file deleted, fatal |
 | load | `llama-server` stays alive and `/health` goes 200 within `load_timeout_s` | fatal |
 | smoke test | `/props` reports vision on; a text request and a **real image request** both return text; with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
-| deadline | whole boot finishes within `deadline_s` | fatal |
+| deadline | the boot, not counting the download, finishes within `deadline_s` | fatal, naming the step it was stuck at |
 | serving | `llama-server` exits later | fatal |
 | after fatal | no PyWorker left to report it, `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
 
@@ -99,7 +99,7 @@ itself reports, never on an inference:
 - **`deploy.py watch`** runs at home next to the shim (see
   `deploy/orch-watch.service`). Every minute it destroys workers Vast still
   reports as booting (`CREATING`/`LOADING`/`STARTING`…, all billed) more than
-  `boot.deadline_s + limits.stuck_grace_s` after it first saw them, destroys
+  `boot.deadline_s + boot.download_max_s + limits.stuck_grace_s` after it first saw them, destroys
   recorded orphans, and pauses the endpoint if the account's running $/hr, as
   Vast reports it, exceeds `limits.max_hourly_usd`. Worker statuses it doesn't
   recognise and unrecorded instances are reported, never acted on.
@@ -273,10 +273,11 @@ For vector storage / RAG, point the embedding source at the same base URL
 (OpenAI-compatible); the model is `embedding.served_name` (`EMBED_MODEL_NAME`
 in `shim/.env`). An embedding request wakes a worker like any other.
 
-The first message after an idle period waits for a worker. The example config
-keeps no stopped workers (`cold_workers = 0`), so every start downloads ~29 GB
-on a fresh machine; set `cold_workers = 1` to keep one stopped worker with the
-weights on disk (storage cost only), which resumes in a few minutes. Streaming shows nothing until the worker is up, then flows normally.
+The first message after an idle period waits for a worker. The example configs
+keep no stopped workers (`cold_workers = 0`), so every start downloads the
+weights (about 29 GB for the default config, 17 GB for WaifuGemma4) on a fresh
+machine; see **Downloads and cold starts** below for the trade-off. Streaming
+shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
 
@@ -288,6 +289,35 @@ states.
 - **Price vs speed:** loosen or tighten `search_params`. `inet_down` matters
   because a slow host bills you for every minute spent downloading.
 - **Quant:** change `model.file`; `check` confirms it exists and that disk fits.
+
+### Downloads and cold starts
+
+Workers download weights with `huggingface_hub` + `hf_xet` (pinned versions,
+installed into a venv on the worker), which is Hugging Face's recommended way
+to fetch Xet-stored files. If that can't be set up, they fall back to aria2c,
+then curl. Every file is still checked against the pinned revision's size and
+sha256. The log shows the method and progress every 30 s, and the final
+speed.
+
+A host's advertised `inet_down` is not what you get from Hugging Face: a test
+on a 1336 Mbps host managed 5–11 MB/s over plain HTTP. So the download has its
+own limits instead of eating the boot deadline:
+
+- `download_min_mbps` (default 25): a file averaging less after 90 s fails the
+  boot right away with "weights download too slow on this host", instead of
+  billing for 40 minutes. The autoscaler (or your next `rent-test`) can pick
+  another host. Set 0 to turn the check off.
+- `download_max_s` (default 3600): all downloads together must finish within it.
+- A download that receives nothing for 2 minutes is restarted.
+
+Every cold start downloads everything again. To skip that, set
+`endpoint.cold_workers = 1`: one stopped worker keeps its verified weights on
+disk and resumes without downloading. A stopped worker still pays Vast's
+storage rate for its disk (`template.disk_gb`), and the worker it keeps is on
+one host, which may be unavailable when you need it. With `cold_workers = 0`
+nothing is billed while idle, and each start pays for the download time
+instead. Worst case with the default 25 MB/s floor, the default config's
+29 GB takes about 20 minutes (less on fast hosts).
 
 ## Tests
 

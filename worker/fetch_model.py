@@ -21,9 +21,18 @@ Configuration (environment):
   DOWNLOAD_CONNECTIONS  aria2c connections per file, default 16
   MIN_FREE_GB_AFTER     free space to leave on disk, default 2
   DOWNLOAD_PROGRESS_S   seconds between progress lines, default 30
+  DOWNLOAD_METHOD       auto (default): huggingface_hub + hf_xet when HF_PYTHON
+                        is set, else aria2c/curl; hf; direct (aria2c/curl only)
+  HF_PYTHON             python with huggingface_hub[hf_xet] (boot.sh sets it)
+  DOWNLOAD_MIN_MBPS     give up when a file's average speed after
+                        DOWNLOAD_PROBE_S (default 90) seconds is below this many
+                        MB/s, default 25; 0 = no minimum. Another host may be faster.
+  DOWNLOAD_STALL_S      restart an attempt that has received nothing for this
+                        long, default 120
+  DOWNLOAD_MAX_S        give up when all downloads together take longer, default 3600
 
 Exit status: 0 ok, 2 bad configuration / file not found on the Hub,
-3 not enough disk, 4 download failed, 5 verification failed.
+3 not enough disk, 4 download failed, 5 verification failed, 6 too slow.
 """
 
 import hashlib
@@ -45,14 +54,28 @@ MAX_ATTEMPTS = int(os.environ.get("DOWNLOAD_MAX_ATTEMPTS", "5"))
 CONNECTIONS = max(1, min(16, int(os.environ.get("DOWNLOAD_CONNECTIONS", "16"))))
 MIN_FREE_AFTER = float(os.environ.get("MIN_FREE_GB_AFTER", "2")) * 1024**3
 PROGRESS_S = max(1.0, float(os.environ.get("DOWNLOAD_PROGRESS_S", "30")))
+METHOD = os.environ.get("DOWNLOAD_METHOD", "auto").strip() or "auto"
+HF_PYTHON = os.environ.get("HF_PYTHON", "").strip()
+HF_DOWNLOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_download.py")
+MIN_RATE = float(os.environ.get("DOWNLOAD_MIN_MBPS", "25")) * 1e6
+PROBE_S = float(os.environ.get("DOWNLOAD_PROBE_S", "90"))
+STALL_S = float(os.environ.get("DOWNLOAD_STALL_S", "120"))
+MAX_S = float(os.environ.get("DOWNLOAD_MAX_S", "3600"))
+STARTED = time.time()
 
-EXIT_CONFIG, EXIT_DISK, EXIT_DOWNLOAD, EXIT_VERIFY = 2, 3, 4, 5
+EXIT_CONFIG, EXIT_DISK, EXIT_DOWNLOAD, EXIT_VERIFY, EXIT_SLOW = 2, 3, 4, 5, 6
 
 
 class FetchError(Exception):
     def __init__(self, msg, code):
         super().__init__(msg)
         self.code = code
+
+
+class TooSlow(FetchError):
+    """Not retried: the same host will be just as slow on the next attempt."""
+    def __init__(self, msg):
+        super().__init__(msg, EXIT_SLOW)
 
 
 def log(msg):
@@ -155,47 +178,110 @@ def on_disk(path):
         return 0
 
 
-def run_with_progress(cmd, dest, size):
-    """Run the downloader, logging how far it has got every PROGRESS_S seconds,
-    so a slow or stalled download shows up in the log while it happens."""
+def partial_bytes(local_dir):
+    """Bytes huggingface_hub has written so far: it downloads into
+    LOCAL_DIR/.cache/huggingface/download/*.incomplete and renames at the end."""
+    total = 0
+    for root, _, files in os.walk(os.path.join(local_dir, ".cache", "huggingface", "download")):
+        total += sum(on_disk(os.path.join(root, f)) for f in files if f.endswith(".incomplete"))
+    return total
+
+
+def _stop(p):
+    p.terminate()
+    try:
+        p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+
+
+def run_with_progress(cmd, measure, name, size):
+    """Run a downloader. Logs progress every PROGRESS_S seconds, restarts an
+    attempt that has stalled, and gives up early on a host too slow to finish
+    in reasonable time instead of downloading until the boot deadline."""
     p = subprocess.Popen(cmd)
-    t0 = last_t = time.time()
-    last_b = start_b = on_disk(dest)
+    t0 = last_t = moved_t = time.time()
+    start_b = last_b = moved_b = measure()
+    tick = min(5.0, PROGRESS_S)
     while True:
         try:
-            return p.wait(timeout=PROGRESS_S)
+            return p.wait(timeout=tick)
         except subprocess.TimeoutExpired:
             pass
-        now, got = time.time(), on_disk(dest)
-        rate = (got - last_b) / max(now - last_t, 1e-6)
+        now, got = time.time(), measure()
         avg = (got - start_b) / max(now - t0, 1e-6)
-        left = f", ~{(size - got) / avg / 60:.0f} min left" if avg > 0 else ""
-        log(f"{os.path.basename(dest)}: {got / 1024**3:.2f}/{size / 1024**3:.2f} GiB "
-            f"({100 * got / max(size, 1):.0f}%), {rate / 1e6:.1f} MB/s{left}")
-        last_t, last_b = now, got
+        if got > moved_b:
+            moved_t, moved_b = now, got
+        if now - last_t >= PROGRESS_S:
+            rate = (got - last_b) / max(now - last_t, 1e-6)
+            left = f", ~{(size - got) / avg / 60:.0f} min left" if avg > 0 else ""
+            log(f"{name}: {got / 1024**3:.2f}/{size / 1024**3:.2f} GiB "
+                f"({100 * got / max(size, 1):.0f}%), {rate / 1e6:.1f} MB/s{left}")
+            last_t, last_b = now, got
+        if now - moved_t >= STALL_S:
+            _stop(p)
+            raise FetchError(f"{name}: no data for {STALL_S:.0f}s, restarting the download", EXIT_DOWNLOAD)
+        if MIN_RATE > 0 and now - t0 >= PROBE_S and avg < MIN_RATE:
+            _stop(p)
+            raise TooSlow(f"{name}: {avg / 1e6:.1f} MB/s average over {now - t0:.0f}s is below "
+                          f"DOWNLOAD_MIN_MBPS={MIN_RATE / 1e6:g}; the remaining "
+                          f"{(size - got) / 1024**3:.1f} GiB would take ~{(size - got) / max(avg, 1) / 60:.0f} min "
+                          f"on this host")
+        if now - STARTED >= MAX_S:
+            _stop(p)
+            raise TooSlow(f"downloads have taken over DOWNLOAD_MAX_S={MAX_S:.0f}s")
 
 
-def download(url, dest, size):
+def direct_cmd(url, dest):
     tmp_dir, name = os.path.dirname(dest), os.path.basename(dest)
     if shutil.which("aria2c"):
+        # No per-connection speed floor (--lowest-speed-limit): Hugging Face's
+        # CDN serves each connection slowly and aria2c dropped most of them
+        # (error 5), leaving one or two. Stalls are caught above instead.
         cmd = ["aria2c", f"-x{CONNECTIONS}", f"-s{CONNECTIONS}", "-k1M", "-c",
                "--file-allocation=none", "--auto-file-renaming=false",
                "--allow-overwrite=true", "--summary-interval=0",
                "--console-log-level=warn", "--download-result=hide",
                "--max-tries=5", "--retry-wait=5", "--timeout=60",
-               "--connect-timeout=30", "--lowest-speed-limit=512K",
-               "-d", tmp_dir, "-o", name]
+               "--connect-timeout=30", "-d", tmp_dir, "-o", name]
         if HF_TOKEN:
             cmd += ["--header", f"Authorization: Bearer {HF_TOKEN}"]
-        cmd.append(url)
+        return cmd + [url]
+    cmd = ["curl", "-fL", "--retry", "5", "--retry-delay", "5",
+           "--connect-timeout", "30", "-C", "-", "-sS", "-o", dest]
+    if HF_TOKEN:
+        cmd += ["-H", f"Authorization: Bearer {HF_TOKEN}"]
+    return cmd + [url]
+
+
+def use_hf():
+    if METHOD == "direct":
+        return False
+    ok = bool(HF_PYTHON) and os.access(HF_PYTHON, os.X_OK)
+    if METHOD == "hf" and not ok:
+        raise FetchError(f"DOWNLOAD_METHOD=hf but HF_PYTHON ({HF_PYTHON or 'unset'}) is not runnable", EXIT_CONFIG)
+    return ok
+
+
+def download(repo, revision, path, url, dest, size, hf):
+    name = os.path.basename(dest)
+    if hf:
+        local_dir = os.path.join(MODELS_DIR, repo.replace("/", "__"))
+        # A partial file from an earlier direct attempt is no use to hf_xet;
+        # free its space, and drop leftovers from killed attempts.
+        for f in (dest, dest + ".aria2"):
+            if os.path.exists(f):
+                os.remove(f)
+        dl = os.path.join(local_dir, ".cache", "huggingface", "download")
+        for root, _, files in os.walk(dl):
+            for f in files:
+                if f.endswith(".incomplete"):
+                    os.remove(os.path.join(root, f))
+        cmd = [HF_PYTHON, HF_DOWNLOAD, repo, path, revision, local_dir]
+        rc = run_with_progress(cmd, lambda: partial_bytes(local_dir) + on_disk(dest), name, size)
     else:
-        cmd = ["curl", "-fL", "--retry", "5", "--retry-delay", "5",
-               "--connect-timeout", "30", "--speed-limit", "524288",
-               "--speed-time", "60", "-C", "-", "-sS", "-o", dest]
-        if HF_TOKEN:
-            cmd += ["-H", f"Authorization: Bearer {HF_TOKEN}"]
-        cmd.append(url)
-    rc = run_with_progress(cmd, dest, size)
+        rc = run_with_progress(direct_cmd(url, dest), lambda: on_disk(dest), name, size)
     got = os.path.getsize(dest) if os.path.exists(dest) else 0
     if rc != 0 or got != size:
         raise FetchError(f"download of {name} incomplete (exit {rc}, {got}/{size} bytes)", EXIT_DOWNLOAD)
@@ -233,15 +319,27 @@ def fetch(repo, revision, path):
 
     url = (f"{HF_ENDPOINT}/{urllib.parse.quote(repo, safe='/')}/resolve/"
            f"{urllib.parse.quote(revision, safe='')}/{urllib.parse.quote(path)}")
+    hf, hf_failures = use_hf(), 0
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        how = "huggingface_hub/hf_xet" if hf else ("aria2c" if shutil.which("aria2c") else "curl")
         try:
             t0 = time.time()
-            download(url, dest, size)
-            log(f"{path}: downloaded in {time.time() - t0:.0f}s")
+            log(f"{path}: downloading with {how}")
+            download(repo, revision, path, url, dest, size, hf)
+            dt = time.time() - t0
+            fetched = size if hf else size - have   # hf_xet starts from zero
+            log(f"{path}: downloaded in {dt:.0f}s ({fetched / max(dt, 1e-6) / 1e6:.1f} MB/s)")
             break
+        except TooSlow:
+            raise
         except FetchError as e:
             if attempt == MAX_ATTEMPTS:
                 raise
+            if hf:
+                hf_failures += 1
+                if hf_failures >= 2 and METHOD != "hf":
+                    hf = False
+                    log(f"{path}: huggingface_hub failed twice, switching to direct download")
             wait = min(60, 5 * 2 ** (attempt - 1))
             log(f"{e}; retry {attempt}/{MAX_ATTEMPTS - 1} in {wait}s")
             time.sleep(wait)

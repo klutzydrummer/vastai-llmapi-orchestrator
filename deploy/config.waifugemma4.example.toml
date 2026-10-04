@@ -55,9 +55,10 @@ gpu_ram       = 24
 # download speed (inet_down). The server-cuda image (CUDA 12.8) ships compiled
 # code for Ampere 8.6, Ada 8.9 and Blackwell 12.0, and PTX that the driver
 # JIT-compiles on first start for the rest (Turing 7.5, A100 8.0, ...).
-# compute_cap (x100) >= 750 keeps Pascal (P40) and Volta (V100) out: no int8
-# tensor cores and slow FP16.
-search_params = "num_gpus=1 gpu_ram>=22 dph_total<=0.40 cuda_max_good>=12.8 compute_cap>=750 inet_down>=500 reliability>0.98 direct_port_count>=1"
+# compute_cap (x100) >= 800 keeps to Ampere and newer: older cards (P40, V100,
+# Turing) lack features or have no prebuilt kernels, so their first load
+# JIT-compiles for many minutes.
+search_params = "num_gpus=1 gpu_ram>=22 dph_total<=0.40 cuda_max_good>=12.8 compute_cap>=800 inet_down>=500 reliability>0.98 direct_port_count>=1"
 
 [limits]
 # `check` (and so `apply`) refuses configs that could spend more than this.
@@ -77,7 +78,13 @@ disk_gb = 40
 [boot]
 orch_repo        = "klutzydrummer/vastai-llmapi-orchestrator"
 orch_ref         = "main"    # resolved to a commit sha on apply
-deadline_s       = 2400      # container start -> ready, else the worker reports an error
+deadline_s       = 2400      # boot.sh start -> ready, not counting the weight download; else ORCH_FATAL
+# The download has its own limits: a file averaging under download_min_mbps
+# (MB/s) after 90 s fails the boot early (this host is too slow; another may
+# not be), a download with no data for 2 minutes is restarted, and all
+# downloads together must finish within download_max_s.
+download_min_mbps = 25
+download_max_s    = 3600
 load_timeout_s   = 900
 pyworker_ref     = "60cfeca889f979fd73cf9e00adcd7b0ebc016fdc"
 vast_sdk_version = "1.8.3"
