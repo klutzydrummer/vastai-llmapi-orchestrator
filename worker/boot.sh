@@ -138,7 +138,9 @@ fi
         echo "fatal" > "$STATE_FILE"
         echo "[$(date -u '+%H:%M:%S')] [boot] $FATAL_MARK: not ready within ${BOOT_DEADLINE}s" >> "$MODEL_LOG"
         schedule_fatal_cleanup
-        pkill -f "$LLAMA_SERVER_BIN" 2>/dev/null
+        # pkill exits 1 when nothing matched; anything higher means it couldn't run.
+        pkill -f "$LLAMA_SERVER_BIN" 2>>"$MODEL_LOG"; rc=$?
+        [ "$rc" -le 1 ] || echo "[$(date -u '+%H:%M:%S')] [boot] warn: pkill failed (exit $rc); llama-server may still be running" >> "$MODEL_LOG"
     fi
 ) &
 
@@ -160,6 +162,7 @@ for pair in python3:python3 git:git openssl:openssl curl:curl; do
     command -v "${pair%%:*}" >/dev/null 2>&1 || need+=("${pair##*:}")
 done
 if [ ${#need[@]} -gt 0 ]; then
+    [ "${ORCH_SKIP_APT:-0}" != "1" ] || fatal "missing: ${need[*]} (ORCH_SKIP_APT=1, not installing)"
     log "installing: ${need[*]}"
     apt_install "${need[@]}" || fatal "apt-get install failed for: ${need[*]}"
 fi

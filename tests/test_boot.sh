@@ -90,11 +90,32 @@ grep -q "already verified, skipping" "$LAST_LOG" \
 run_case "too little VRAM fails before downloading" fatal 30 FAKE_VRAM_MB=8000
 grep -q "\[fetch\]" "$LAST_LOG" && { echo "FAIL  fetched despite VRAM check"; FAIL=$((FAIL+1)); }
 
+# path_without DIR CMD...: a PATH dir with every command except CMD...
+path_without(){
+    local dir="$1"; shift; mkdir -p "$dir"
+    for d in $WORK/bin ${PATH//:/ }; do
+        for f in "$d"/*; do [ -x "$f" ] && [ ! -e "$dir/${f##*/}" ] && ln -s "$f" "$dir/${f##*/}"; done
+    done 2>/dev/null
+    for c in "$@"; do rm -f "$dir/$c"; done
+}
+# No openssl, and an apt-get that only records that it was called.
+NOSSL="$WORK/nossl"; path_without "$NOSSL" openssl apt-get
+printf '#!/bin/sh\necho called >> "%s"\n' "$WORK/apt_calls" > "$NOSSL/apt-get"; chmod +x "$NOSSL/apt-get"
+run_case "missing required tool with ORCH_SKIP_APT is fatal, no apt" fatal 20 PATH="$NOSSL"
+grep -q "missing: openssl" "$LAST_LOG" && [ ! -e "$WORK/apt_calls" ] \
+    && { echo "PASS  ORCH_SKIP_APT respected for required packages"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  expected 'missing: openssl' and no apt-get call"; FAIL=$((FAIL+1)); }
+
 run_case "missing file on the Hub" fatal 30 MODEL_FILE=nope.gguf
 run_case "llama-server crashes during load" fatal 30 FAKE_LLAMA_MODE=crash
 run_case "vision not loaded (bad mmproj)" fatal 30 FAKE_LLAMA_MODE=novision
 run_case "text request fails" fatal 30 FAKE_LLAMA_MODE=textfail
 run_case "boot deadline" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
+NOPKILL="$WORK/nopkill"; path_without "$NOPKILL" pkill
+HOLD=1 run_case "boot deadline without pkill" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6 PATH="$NOPKILL"
+grep -q "warn: pkill failed" "$LAST_LOG" \
+    && { echo "PASS  a pkill that can't run is logged"; PASS=$((PASS+1)); } \
+    || { echo "FAIL  pkill failure not logged"; FAIL=$((FAIL+1)); }
 run_case "llama-server dies after ready" ready_then_fatal 40 FAKE_LLAMA_MODE=die_after_ready
 
 rm -rf "$WORK/models"
