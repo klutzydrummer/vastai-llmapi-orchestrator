@@ -4,7 +4,11 @@
 Behaviour knobs (env):
   FAKE_LLAMA_MODE  ok (default) | crash (exit during load) | novision |
                    textfail | die_after_ready | oom_mmproj (CUDA out of
-                   memory loading the projector, as on rental 54231885)
+                   memory loading the projector, as on rental 54231885) |
+                   thoughtleak (text reply is only '<|thought|>\n') |
+                   roleleak (image reply starts with 'user\n') |
+                   thinking (the answer is still in reasoning_content when
+                   max_tokens runs out), the replies seen on rental 54245444
   FAKE_LLAMA_LOAD_SECS  seconds of 503 before /health turns 200 (default 2)
   FAKE_EMBED_MODE  ok (default) | zero (all-zero vectors) | crash (the
                    --embedding server exits during load)
@@ -112,6 +116,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path == "/apply-template" and not embedding:
+            self._json(200, {"prompt": "<bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n"})
+            return
         if embedding:
             if self.path != "/v1/embeddings":
                 self._json(501, {"error": {"message": "embedding server: chat not supported"}})
@@ -134,7 +141,14 @@ class H(BaseHTTPRequestHandler):
             self._json(500, {"error": {"message": "image input is not supported"}})
             return
         text = "Red" if is_image else "pong"
-        self._json(200, {"choices": [{"message": {"role": "assistant", "content": text}}]})
+        msg = {"role": "assistant", "content": text}
+        if MODE == "thoughtleak" and not is_image:
+            msg["content"] = "<|thought|>\n"
+        elif MODE == "roleleak" and is_image:
+            msg["content"] = "user\nRed"
+        elif MODE == "thinking":
+            msg = {"role": "assistant", "content": "", "reasoning_content": "The user wants one word, so"}
+        self._json(200, {"choices": [{"message": msg, "finish_reason": "stop"}]})
 
 
 srv = ThreadingHTTPServer(("127.0.0.1", port), H)

@@ -25,7 +25,7 @@ served_name = "qwen3-embedding"           # model id for /v1/embeddings
 repo        = "Qwen/Qwen3-Embedding-0.6B-GGUF"
 file        = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 revision    = "main"
-ctx         = 8192                        # longest single input, in tokens
+ctx         = 4096                        # longest single input, in tokens; 8192 takes ~2.8 GiB more VRAM
 pooling     = "last"                      # Qwen3-Embedding uses last-token pooling
 gpu         = true                        # on the GPU next to the chat model; false = CPU (-ngl 0, slower, no VRAM)
 cache_type  = "f16"                       # its context cache; the worker drops to q8_0 (and ctx to 2048) if VRAM is short

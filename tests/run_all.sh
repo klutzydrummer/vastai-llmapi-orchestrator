@@ -27,3 +27,4 @@ run 120 python3 tests/test_shim.py
 run 120 python3 tests/test_deploy.py
 run 60 python3 tests/test_fetch.py
 run 60 python3 tests/test_vram.py
+run 60 python3 tests/test_smoke.py

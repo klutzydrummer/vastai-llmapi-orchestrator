@@ -169,6 +169,25 @@ def rental_54231885_fits_with_embedding_on_gpu():
 
 
 @case
+def calibrated_to_rental_54245444():
+    """estimates match what b11371 used on rental 54245444 and never undercount the full set"""
+    chat, mm, emb = facts("gemma4", 16018 * MiB), facts("gemma4-mmproj", MMPROJ_SIZE), facts("qwen3-embed", EMBED_SIZE)
+    for ub, measured in ((8192, 4900), (4096, 2450), (2048, 1225)):
+        est = vram.compute_bytes(emb, ub, embedding=True) / MiB
+        assert abs(est - measured) <= measured * 0.01, (ub, est)
+    assert 536 <= vram.compute_bytes(chat, 1120) / MiB <= 600
+    assert abs(vram.projector_bytes(mm, 1120) / MiB - 1297) <= 13
+    # Everything loaded at embedding ctx 4096 / 2048: 22560 / 21120 MiB used, 120 of it the idle GPU.
+    for ectx, used in ((4096, 22560), (2048, 21120)):
+        p = vram.plan(10**6, 24576, chat, cfg(embed_ctx=ectx), mm, emb)
+        assert p["embed_ctx"] == ectx and p["ctx"] == 32768
+        assert used - 120 <= p["need_mib"] - p["parts_mib"]["margin"] <= used + 300, (ectx, p["parts_mib"])
+    # The old 8192 default doesn't fit on the 3090; the planner gives up embedding context first.
+    p = vram.plan(23859, 24576, chat, cfg(embed_ctx=8192, ctx_min=16384), mm, emb)
+    assert p["fits"] and p["embed_ctx"] == 4096 and p["embed_cache"] == "f16" and p["ctx"] == 32768, vram.describe(p)
+
+
+@case
 def levers_go_in_order():
     """short memory gives up embedding context first, then its cache type, then chat context"""
     chat, mm, emb = facts("gemma4", CHAT_SIZE), facts("gemma4-mmproj", MMPROJ_SIZE), facts("qwen3-embed", EMBED_SIZE)

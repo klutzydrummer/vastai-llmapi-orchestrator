@@ -137,7 +137,7 @@ def docker_options(cfg, pins):
             "EMBED_REPO": e["repo"],
             "EMBED_FILE": e["file"],
             "EMBED_REVISION": pins.get("embed_revision", ""),
-            "EMBED_CTX": e.get("ctx", 8192),
+            "EMBED_CTX": e.get("ctx", 4096),
             "EMBED_POOLING": e.get("pooling", "last"),
             "EMBED_GPU": "1" if e.get("gpu", True) else "0",
             "EMBED_CACHE_TYPE": e.get("cache_type", "f16"),
@@ -347,7 +347,7 @@ def plan_settings(cfg):
                           f"and llama.ctx={l['ctx']}")
     return {"ctx": l["ctx"], "ctx_min": ctx_min, "parallel": l["parallel"], "cache_type": cache,
             "ubatch": l.get("ubatch", 512), "image_tokens": l.get("image_tokens", 1120),
-            "embed_ctx": e.get("ctx", 8192), "embed_cache": ecache, "embed_gpu": e.get("gpu", True),
+            "embed_ctx": e.get("ctx", 4096), "embed_cache": ecache, "embed_gpu": e.get("gpu", True),
             "mmproj_offload": "--no-mmproj-offload" not in str(l.get("extra_args", "")).replace(";", " ").split()}
 
 
