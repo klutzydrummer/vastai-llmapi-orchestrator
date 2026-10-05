@@ -30,7 +30,7 @@ LLAMA_PORT="18000"   # pyworker's workers/openai/core.py hardcodes this port
 CHAT_PORT="18010"
 EMBED_PORT="18011"
 EMBED_SERVED_NAME="${EMBED_SERVED_NAME:-}"
-EMBED_CTX="${EMBED_CTX:-8192}"
+EMBED_CTX="${EMBED_CTX:-4096}"
 EMBED_POOLING="${EMBED_POOLING:-last}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-model}"
 LLAMA_CTX="${LLAMA_CTX:-32768}"
@@ -512,7 +512,7 @@ log "VRAM after chat: $(gpu_used) MiB used (was $used0 MiB before it started; es
 
 # ── prove it works ────────────────────────────────────────────────────────────
 phase "smoke test"
-LLAMA_URL="http://$LLAMA_HOST:$LLAMA_PORT" SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
+LLAMA_URL="http://$LLAMA_HOST:$LLAMA_PORT" SERVED_MODEL_NAME="$SERVED_MODEL_NAME" LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-0}" \
     EMBED_SERVED_NAME="$([ -n "${EMBED_PATH:-}" ] && echo "${EMBED_SERVED_NAME:-embedding}")" \
     python3 "$ORCH_DIR/smoke_test.py" 2>&1 | while IFS= read -r line; do echo "$line" | tee -a "$MODEL_LOG"; console "$line"; done
 [ "${PIPESTATUS[0]}" -eq 0 ] || fatal "smoke test failed"

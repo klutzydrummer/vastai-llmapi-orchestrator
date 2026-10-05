@@ -120,6 +120,13 @@ run_case "missing file on the Hub" fatal 30 MODEL_FILE=nope.gguf
 run_case "llama-server crashes during load" fatal 30 FAKE_LLAMA_MODE=crash
 run_case "vision not loaded (bad mmproj)" fatal 30 FAKE_LLAMA_MODE=novision
 run_case "text request fails" fatal 30 FAKE_LLAMA_MODE=textfail
+run_case "text reply is only a thought token" fatal 30 FAKE_LLAMA_MODE=thoughtleak
+check "names the leaked token" grep -q "chat-template token '<|thought|>' in the answer, and nothing else" "$LAST_LOG"
+check "logs the prompt the template built" grep -q "prompt the template built ends with" "$LAST_LOG"
+run_case "image reply starts with a role name" fatal 30 FAKE_LLAMA_MODE=roleleak
+check "names the role prefix" grep -q "answer starts with a role name ('user')" "$LAST_LOG"
+run_case "thinking model still thinking at max_tokens" ready 30 FAKE_LLAMA_MODE=thinking LLAMA_REASONING_BUDGET=-1
+run_case "reasoning only with thinking off" fatal 30 FAKE_LLAMA_MODE=thinking LLAMA_REASONING_BUDGET=0
 run_case "boot deadline" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
 check "deadline failure names the step it was stuck at" grep -q "not ready within 6s (still at: loading the model)" "$LAST_LOG"
 check "deadline ORCH_FATAL reaches the container console" grep -q "ORCH_FATAL: not ready within 6s" "$LAST_CONSOLE"
