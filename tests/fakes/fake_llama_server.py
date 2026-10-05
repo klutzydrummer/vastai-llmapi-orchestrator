@@ -36,6 +36,7 @@ HELP = """usage: llama-server [options]
 -fa, --flash-attn [on|off|auto]
 --jinja, --no-jinja
 --reasoning-budget N
+--chat-template-kwargs STRING
 --no-webui
 """
 
