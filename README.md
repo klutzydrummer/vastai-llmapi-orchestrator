@@ -308,7 +308,9 @@ states.
 example `America/Chicago`) in `shim/.env`, and the shim keeps one worker
 awake during those hours: it sends a 1-token request every `WARM_PING_S`
 (300 s), under the endpoint's `inactivity_timeout`, so the worker is never
-released. It sends one at a time, so a ping waiting on a cold start isn't
+released. The pings go to the embedding model, a separate llama-server, so
+the chat model's prompt cache for each conversation is left alone (without
+`EMBED_MODEL_NAME` they'd use the chat model and could evict one). It sends one at a time, so a ping waiting on a cold start isn't
 doubled up. Outside the hours nothing is sent and the worker idles out as usual. Start the window
 about 25 minutes before you need it, since the first ping pays the cold start.
 While warm, a worker bills its full rate (a 3090 at about $0.17/hr is about

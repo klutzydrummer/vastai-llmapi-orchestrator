@@ -159,6 +159,9 @@ class Shim:
             self.client = CoroutineServerless(api_key=self.cfg.vast_api_key)
             await self.client.__aenter__()
         if self.cfg.warm_hours:
+            if not self.cfg.embed_model_name:
+                log.warning("warm hours without EMBED_MODEL_NAME: pings use the chat model and can push a "
+                            "conversation's cached prompt out of its slot")
             if not self.cfg.warm_tz:
                 log.warning("WARM_TZ is not set; warm hours use this machine's clock (now %s). In Docker "
                             "that is usually UTC", self.now().strftime("%H:%M %Z"))
@@ -187,12 +190,21 @@ class Shim:
         return self._endpoint
 
     # ── warm hours ───────────────────────────────────────────────────────────
+    def ping_request(self):
+        """The cheapest request that keeps a worker busy. With an embedding
+        model it goes to the embedding llama-server, leaving the chat model's
+        slots (and the prompt cache of each conversation in them) untouched.
+        Without one it has to use the chat model, and takes the least recently
+        used slot, whose cached prompt is then lost."""
+        if self.cfg.embed_model_name:
+            return "/v1/embeddings", {"model": self.cfg.embed_model_name, "input": "hi"}
+        return "/v1/completions", {"model": self.cfg.served_model_name, "prompt": "hi", "max_tokens": 1}
+
     async def _ping(self):
         """One minimal request through the autoscaler: starts a worker if none
         runs, and counts as activity so a running one isn't released."""
         try:
-            await self._dispatch("/v1/completions", {
-                "model": self.cfg.served_model_name, "prompt": "hi", "max_tokens": 1}, False)
+            await self._dispatch(*self.ping_request(), False)
             return "ok"
         except Exception as e:
             log.warning("warm ping failed: %s", e)

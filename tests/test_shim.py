@@ -221,6 +221,15 @@ async def main():
     await runner.cleanup()
     ok("warm hours: a worker is pinged awake and /status shows it")
 
+    # with an embedding model, pings go to it and leave the chat model's prompt cache alone
+    n0 = len(fake.received)
+    s, runner = await make_shim(warm_hours=[(0, 1440)], warm_ping_s=0.3, embed_model_name="qwen3-embed")
+    await asyncio.sleep(0.8)
+    pings = fake.received[n0:]
+    assert pings and all(p == {"model": "qwen3-embed", "input": "hi"} for p in pings), pings
+    await runner.cleanup()
+    ok("warm pings use the embedding model when there is one")
+
     # a ping waiting on a cold start is not doubled up
     fake.ready_at = time.time() + 1.5
     n0 = len(fake.received)
