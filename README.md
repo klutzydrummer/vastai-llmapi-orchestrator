@@ -66,6 +66,22 @@ config that leaves any of them out, has no `dph_total<=` ceiling, or whose
 worst case `(max_workers + test_workers) x ceiling` exceeds
 `[limits] max_hourly_usd`.
 
+That worst case covers the running price only. Vast bills three things: the
+GPU and the disk per second while running (together `dph_total`; the disk
+also while stopped) and bandwidth per byte, in any state. Bandwidth is not in
+`dph_total`, and every cold start downloads the weights again (18.7 GB for
+WaifuGemma4): about $0.46 on a host charging $25/TB, more than two hours of a
+cheap 3090. So the example configs also cap the download price with
+`inet_down_cost<=0.01` ($/GB, at most $0.19 per WaifuGemma4 cold start), and
+`check` warns when `search_params` has no `inet_down_cost<=` ceiling. `check`
+names the most a cold start's download can cost under that ceiling, and its
+offer table shows, per offer, the download cost (`dl`) and one cold start's
+cost (`cold`: `dph_total` for the boot, estimated from a 12-minute measured
+boot scaled to the weights, plus the download). `rent-test` prints the
+download cost of the offer it picks. Both still rank offers by `dph_total`,
+as Vast's autoscaler does with the same `search_params`; the
+`inet_down_cost` ceiling is what keeps an expensive download out of either.
+
 ## No guessing with money
 
 Every decision that creates or destroys something paid rests on what Vast
@@ -230,13 +246,26 @@ the step it was stuck at. `logs <id> --once` prints what is there now without
 waiting.
 
 For the full log, including llama-server's own output, on the instance
-(`vastai ssh-url <id>`):
+(`vastai ssh-url <id>`, with an SSH key added to your Vast account; Vast puts
+the account's keys on every rental):
 
 ```bash
 tail -f /workspace/orch/model.log      # wait for ORCH_READY (or ORCH_FATAL with the reason)
 curl -s localhost:18000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":50}'
 ```
+
+To start `llama-server` by hand there, run it from `/app` or set
+`LD_LIBRARY_PATH=/app`; otherwise it stops with
+`error while loading shared libraries: libllama-server-impl.so`.
+
+A failed test rental stops itself 10 minutes (`ORCH_FATAL_GRACE`) after the
+failure. For a longer look, rent with `rent-test --hold-on-fatal MINUTES`:
+that rental alone waits that long instead, at its full $/hr (printed before
+renting, with the total). It can't exceed `limits.manual_ttl_s`, which still
+stops the rental, and `sweep` and `watch` still destroy it after that. A host
+failure that `rent-test` replaces (stuck at Vast, Vast error, download too
+slow) is still destroyed at once.
 
 That run is the reference for everything after. Remove it with
 `deploy.py destroy` or `sweep --destroy <id>`. It stops itself after
@@ -386,7 +415,9 @@ for you.
   cache; `check` shows whether it fits, and the worker lowers it toward
   `llama.ctx_min` when a card has less free memory than planned.
 - **Price vs speed:** loosen or tighten `search_params`. `inet_down` matters
-  because a slow host bills you for every minute spent downloading.
+  because a slow host bills you for every minute spent downloading, and
+  `inet_down_cost` because the bytes themselves are billed too (see
+  **Spend limits**).
 - **Quant:** change `model.file`; `check` confirms it exists and that disk fits.
 
 ### Downloads and cold starts
@@ -427,7 +458,7 @@ disk and resumes without downloading. A stopped worker still pays Vast's
 storage rate for its disk (`template.disk_gb`), and the worker it keeps is on
 one host, which may be unavailable when you need it. With `cold_workers = 0`
 nothing is billed while idle, and each start pays for the download time
-instead: at the 8–20 MB/s seen so far, 17 GB takes 15–35 minutes and the
+and the downloaded bytes (`inet_down_cost`) instead: at the 8–20 MB/s seen so far, 17 GB takes 15–35 minutes and the
 default config's 29 GB 25–60 minutes.
 
 ## Tests

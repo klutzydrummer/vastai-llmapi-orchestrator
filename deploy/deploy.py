@@ -156,6 +156,36 @@ def price_ceiling(search_params):
     return min(caps) if caps else None
 
 
+def download_price_ceiling(search_params):
+    """The inet_down_cost ($/GB downloaded) upper bound in a Vast search string, or None."""
+    caps = [float(m.group(2)) for m in
+            re.finditer(r"\binet_down_cost\s*(<=|<)\s*([0-9]*\.?[0-9]+)", search_params)]
+    return min(caps) if caps else None
+
+
+# What a cold start costs. Vast bills three things: the running price
+# (dph_total = GPU + disk, per second while running), and bandwidth per byte
+# (inet_down_cost, $/GB), which dph_total leaves out. A cold start downloads
+# every weight file again. Rental 54377166 (RTX 3090, 18.7 GB of weights) went
+# from boot start to ORCH_READY in 706 s: 635 s downloading and verifying
+# (29.4 MB/s overall) and 71 s for everything else. Hosts vary (8-80 MB/s seen),
+# so these are estimates for comparing offers, not limits.
+COLD_START_FETCH_BPS = 29.4e6
+COLD_START_REST_S = 71
+
+
+def cold_start_s(weight_bytes):
+    return COLD_START_REST_S + weight_bytes / COLD_START_FETCH_BPS
+
+
+def download_usd(offer, weight_bytes):
+    """What one cold start's download costs on this offer, or None when Vast didn't say."""
+    try:
+        return float(offer["inet_down_cost"]) * weight_bytes / 1e9
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def check_limits(cfg):
     """Refuse configs that leave spend to Vast's defaults.
 
@@ -385,8 +415,9 @@ def gpu_memory_plan(cfg, files, read_header=_hub_header):
     return p
 
 
-def check(cfg, v=None):
-    """Run every preflight check; return the pins to deploy with."""
+def check(cfg, v=None, facts=None):
+    """Run every preflight check; return the pins to deploy with. facts, if
+    given, receives weight_bytes (all model files together) when known."""
     m, l, b = cfg["model"], cfg["llama"], cfg["boot"]
     problems, pins = [], {}
 
@@ -436,6 +467,9 @@ def check(cfg, v=None):
                 files["embed"] = (e["repo"], pins["embed_revision"], e["file"], sz)
 
     weights_gb = sum(sizes) / 1024**3
+    weight_bytes = sum(sizes) if len(sizes) == len(files) and "chat" in files else None
+    if facts is not None and weight_bytes:
+        facts["weight_bytes"] = weight_bytes
     if sizes:
         need_disk = weights_gb + 12   # image layers, pyworker venv, logs, headroom
         say(f"  info  weights {weights_gb:.1f} GiB; disk {cfg['template']['disk_gb']} GB (need ~{need_disk:.0f})")
@@ -484,20 +518,38 @@ def check(cfg, v=None):
     step("docker options", _opts)
 
     say("offers matching workergroup.search_params")
-    if not re.search(r"\bcompute_cap\s*>=?\s*\d+", cfg["workergroup"]["search_params"]):
+    sp = cfg["workergroup"]["search_params"]
+    if not re.search(r"\bcompute_cap\s*>=?\s*\d+", sp):
         say("  warn  no compute_cap>= filter: old cards (Pascal P40, Volta V100, Turing) can be rented. "
             "Add compute_cap>=800 (Ampere and newer)")
+    down_cap = download_price_ceiling(sp)
+    if down_cap is None:
+        say("  warn  no inet_down_cost<= filter: Vast bills downloads per GB on top of dph_total, and every "
+            "cold start downloads the weights again; some hosts charge about $1 for that. "
+            "Add inet_down_cost<=0.01 ($/GB)")
+    if weight_bytes:
+        gb = weight_bytes / 1e9
+        say(f"  info  bandwidth is billed apart from dph_total (and from limits.max_hourly_usd): each cold "
+            f"start downloads {gb:.1f} GB" + (f", at most ${down_cap * gb:.2f} at inet_down_cost<={down_cap:g}"
+                                             if down_cap is not None else ", at whatever the host charges"))
+        say(f"  info  cold $ = dph_total x {cold_start_s(weight_bytes) / 60:.0f} min (boot estimated from "
+            f"rental 54377166, scaled to these weights) + download $")
     try:
         v = v or vast()
-        offers = v.search_offers(query=cfg["workergroup"]["search_params"] + " rented=False",
+        offers = v.search_offers(query=sp + " rented=False",
                                  order="dph_total", limit=8, storage=cfg["template"]["disk_gb"])
         if not isinstance(offers, list) or not offers:
             problems.append("no offers match search_params right now")
             say("  FAIL  no offers match right now (loosen dph_total or inet_down?)")
         else:
             for o in offers[:8]:
+                dl = download_usd(o, weight_bytes) if weight_bytes else None
+                cold = (float(o.get("dph_total") or 0) * cold_start_s(weight_bytes) / 3600 + dl
+                        if dl is not None else None)
                 say(f"  {o.get('gpu_name', '?'):<18} {o.get('gpu_ram', 0) / 1000:>5.0f} GB  "
                     f"${o.get('dph_total', 0):.3f}/hr  down {o.get('inet_down', 0):>6.0f} Mbps  "
+                    f"dl {'$%.2f' % dl if dl is not None else '?':>5}  "
+                    f"cold {'$%.2f' % cold if cold is not None else '?':>5}  "
                     f"cuda {o.get('cuda_max_good', '?')}  cc {o.get('compute_cap', '?')}  rel {(o.get('reliability') or o.get('reliability2') or 0):.3f}")
     except SystemExit:
         raise
@@ -1417,8 +1469,13 @@ def _rentable_offers(v, cfg, exclude_hosts=(), exclude_offers=(), limit=10):
     return sorted(rows, key=lambda o: float(o.get("dph_total") or 0))
 
 
-def _offer_line(o):
-    return f"offer {o.get('id')} {o.get('gpu_name', '?')} ${float(o.get('dph_total') or 0):.3f}/hr"
+def _offer_line(o, weight_bytes=None):
+    line = f"offer {o.get('id')} {o.get('gpu_name', '?')} ${float(o.get('dph_total') or 0):.3f}/hr"
+    if weight_bytes:
+        dl = download_usd(o, weight_bytes)
+        line += (f" + ${dl:.2f} to download the weights (billed apart from $/hr)" if dl is not None
+                 else " + download price unknown (Vast didn't report inet_down_cost)")
+    return line
 
 
 def cmd_rent_test(cfg, args):
@@ -1434,13 +1491,21 @@ def cmd_rent_test(cfg, args):
     anyway (stop, never retry, if one did). If the offer is then no longer
     listed, someone else took it: the next offer is tried, counting as an
     attempt. A refusal of an offer that is still listed stops the command."""
+    ttl = int(cfg["limits"].get("manual_ttl_s", 14400))
+    hold = getattr(args, "hold_on_fatal", None)
+    if hold is not None and not 0 < hold * 60 <= ttl:
+        raise CheckFailed(f"--hold-on-fatal {hold:g} must be above 0 and at most limits.manual_ttl_s "
+                          f"({ttl / 60:g} min), which stops the rental anyway")
     v = vast()
     say("preflight")
-    pins = check(cfg, v)
-    ttl = int(cfg["limits"].get("manual_ttl_s", 14400))
+    facts = {}
+    pins = check(cfg, v, facts)
+    wb = facts.get("weight_bytes")
     attempts = max(1, int(cfg["limits"].get("rent_attempts", 3)))
     follow = not getattr(args, "no_follow", False)
     opts = docker_options(cfg, pins) + f" -e ORCH_SKIP_PYWORKER=1 -e ORCH_MANUAL_TTL={ttl}"
+    if hold is not None:
+        opts += f" -e ORCH_FATAL_GRACE={int(hold * 60)}"
     t = cfg["template"]
     label = f"orch-test:{cfg['endpoint']['name']}"
     bad_hosts, gone_offers, failures = [], set(), []
@@ -1456,7 +1521,14 @@ def cmd_rent_test(cfg, args):
 
     for attempt in range(1, attempts + 1):
         o = cheapest()
-        say(f"cheapest match: {_offer_line(o)}" + (f" (rental {attempt} of up to {attempts})" if attempt > 1 else ""))
+        say(f"cheapest match: {_offer_line(o, wb)}" + (f" (rental {attempt} of up to {attempts})" if attempt > 1 else ""))
+        if hold is not None:
+            dph = float(o.get("dph_total") or 0)
+            say(f"!! --hold-on-fatal {hold:g}: if this boot fails, the instance keeps running for {hold:g} min "
+                f"(instead of 10) before it stops itself, billing ${dph:.3f}/hr, about "
+                f"${dph * hold / 60:.2f}. Destroy it when done (`deploy.py sweep --destroy ID`); sweep and "
+                f"watch still destroy it after manual_ttl_s={ttl}s. A host failure rent-test replaces is "
+                "still destroyed at once.")
         if args.dry_run:
             say("docker options:\n  " + opts + "\ndry run: nothing rented")
             return
@@ -1470,7 +1542,7 @@ def cmd_rent_test(cfg, args):
             # The offer list may be minutes old by now (preflight, prompt, the last boot).
             fresh = cheapest()
             if fresh.get("id") != o.get("id"):
-                say(f"offers changed; renting {_offer_line(fresh)} instead (within search_params)")
+                say(f"offers changed; renting {_offer_line(fresh, wb)} instead (within search_params)")
             o = fresh
             st = load_state()
             before = {i.get("id") for i in _rows(v.show_instances(), "show_instances")}
@@ -1519,7 +1591,8 @@ def cmd_rent_test(cfg, args):
         if not host_failed(result, boot):
             # Not the host's fault (or not known to be): leave it for a look;
             # it stops itself, and watch/sweep clean up after manual_ttl_s.
-            raise CheckFailed(f"instance {iid} did not boot ({result}); see the log above. It was left as is: "
+            held = f"; it stops itself {hold:g} min after the failure (--hold-on-fatal)" if hold is not None else ""
+            raise CheckFailed(f"instance {iid} did not boot ({result}); see the log above. It was left as is{held}: "
                               f"`deploy.py sweep --destroy {iid}` removes it")
         bad_hosts.append(_host_key(o))
         failures.append(f"instance {iid} failed on {_host_key(o)}")
@@ -1634,11 +1707,16 @@ def main():
                    help="watch: one check, then exit; logs ID: print the log once, don't wait")
     p.add_argument("--no-follow", action="store_true",
                    help="rent-test: rent and record the instance, then exit without following its boot")
+    p.add_argument("--hold-on-fatal", type=float, metavar="MINUTES",
+                   help="rent-test: if the boot fails, keep the instance up this long (instead of 10 min) "
+                        "for SSH debugging before it stops itself; billed at the rental's $/hr")
     p.add_argument("--timeout", type=float, default=0,
                    help="logs ID: seconds to wait for a marker (default: boot.deadline_s + download_max_s + 900)")
     args = p.parse_args()
     if args.instance_id is not None and args.command != "logs":
         p.error(f"{args.command} takes no instance id")
+    if args.hold_on_fatal is not None and args.command != "rent-test":
+        p.error("--hold-on-fatal is for rent-test")
     cfg = load_config(args.config)
     try:
         {"check": cmd_check, "apply": cmd_apply, "status": cmd_status, "logs": cmd_logs,

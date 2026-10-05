@@ -389,6 +389,60 @@ def price_ceiling_required():
 
 
 @case
+def example_configs_cap_the_download_price():
+    """both example configs carry an inet_down_cost<= ceiling ($/GB) of at most 0.01"""
+    for name in ("config.example.toml", "config.waifugemma4.example.toml"):
+        with open(os.path.join(os.path.dirname(__file__), "..", "deploy", name), "rb") as f:
+            cap = deploy.download_price_ceiling(tomllib.load(f)["workergroup"]["search_params"])
+        assert cap is not None and cap <= 0.01, (name, cap)
+    assert deploy.download_price_ceiling("inet_down>=500 inet_down_cost <0.02 inet_down_cost<=0.005") == 0.005
+    assert deploy.download_price_ceiling("inet_down>=500 dph_total<=0.4") is None
+
+
+def run_check(search_params, offers):
+    """check() with the Hub, GitHub and registry answered locally; returns (output, facts)."""
+    cfg = limited(workergroup__search_params=search_params)
+    sizes = {cfg["model"]["file"]: 16_000_000_000, cfg["model"]["mmproj_file"]: 1_200_000_000,
+             cfg["embedding"]["file"]: 1_500_000_000}
+    v = FakeVast()
+    v.offers = offers
+    stubs = {"hf_resolve": lambda repo, rev: "a" * 40, "hf_file_size": lambda repo, sha, path: sizes[path],
+             "gpu_memory_plan": lambda cfg, files: {"fits": True}, "gh_resolve": lambda repo, ref: "b" * 40,
+             "gh_raw_exists": lambda repo, sha, path: True, "image_exists": lambda image: True}
+    real = {k: getattr(deploy, k) for k in stubs}, deploy.say
+    out, facts = [], {}
+    for k, fn in stubs.items():
+        setattr(deploy, k, fn)
+    deploy.say = out.append
+    try:
+        deploy.check(cfg, v, facts)
+    finally:
+        for k, fn in real[0].items():
+            setattr(deploy, k, fn)
+        deploy.say = real[1]
+    return out, facts
+
+
+@case
+def check_shows_download_and_cold_start_cost_per_offer():
+    """check: each offer shows download $ (inet_down_cost x weight GB) and one cold start's cost; bandwidth is named as outside the limits"""
+    sp = BASE_CFG["workergroup"]["search_params"]
+    assert deploy.download_price_ceiling(sp) is not None
+    offers = [{"id": 1, "gpu_name": "RTX 3090", "gpu_ram": 24576, "dph_total": 0.30, "inet_down_cost": 0.01},
+              {"id": 2, "gpu_name": "RTX 3090", "gpu_ram": 24576, "dph_total": 0.31}]
+    out, facts = run_check(sp, offers)
+    assert facts["weight_bytes"] == 18_700_000_000, facts
+    rows = [o for o in out if "RTX 3090" in o]
+    # 18.7 GB x $0.01 = $0.19; boot 71 s + 18.7e9 / 29.4e6 s = 707 s, x $0.30/hr = $0.06
+    assert "dl $0.19" in rows[0] and "cold $0.25" in rows[0], rows
+    assert "dl     ?" in rows[1] and "cold     ?" in rows[1], rows
+    assert any("billed apart from dph_total" in o and "at most $0.19 at inet_down_cost<=0.01" in o for o in out), out
+    assert not any("no inet_down_cost<= filter" in o for o in out), out
+    out, _ = run_check(re.sub(r"\s*inet_down_cost<=[0-9.]+", "", sp), offers)
+    assert any("warn  no inet_down_cost<= filter" in o for o in out), out
+
+
+@case
 def worst_case_over_budget_refused():
     """max_workers x price above max_hourly_usd, or above max_workers_cap, is refused"""
     raises(lambda: deploy.check_limits(limited(limits__max_hourly_usd=0.5)), text="worst case")
@@ -532,7 +586,7 @@ def rent_test_records_the_id_vast_returns():
     v = FakeVast()
     deploy.vast = lambda: v
     real_check = deploy.check
-    deploy.check = lambda cfg, v=None: PINS
+    deploy.check = lambda cfg, v=None, facts=None: PINS
     try:
         deploy.cmd_rent_test(BASE_CFG, args(no_follow=True))
     finally:
@@ -548,20 +602,25 @@ def rent_test_records_the_id_vast_returns():
     assert [i["id"] for i in r["orphans"]] == [iid]
 
 
-def rent_with_boots(*boots, offers=None, v=None):
+def rent_with_boots(*boots, offers=None, v=None, weight_bytes=None, **kw):
     v = v or FakeVast()
     if offers:
         v.offers = offers
     v.boot_plan = list(boots)
     deploy.vast = lambda: v
     real = deploy.check, deploy.VAST_ERROR_CONFIRM_S, deploy.LOGS_POLL_S, deploy.say
-    deploy.check = lambda cfg, v=None: PINS
+
+    def fake_check(cfg, v=None, facts=None):
+        if weight_bytes and facts is not None:
+            facts["weight_bytes"] = weight_bytes
+        return PINS
+    deploy.check = fake_check
     deploy.VAST_ERROR_CONFIRM_S, deploy.LOGS_POLL_S = 0, 0
     out = []
     deploy.say = out.append
     try:
         try:
-            deploy.cmd_rent_test(BASE_CFG, args())
+            deploy.cmd_rent_test(BASE_CFG, args(**kw))
             err = None
         except deploy.CheckFailed as e:
             err = str(e)
@@ -673,6 +732,45 @@ def rent_test_counts_taken_offers_as_attempts():
     v, out, err = rent_with_boots(offers=THREE_HOSTS + [dict(THREE_HOSTS[0], id=780, machine_id=4, dph_total=0.19)], v=v)
     assert err and "3 attempts failed" in err and "offer 779 taken" in err, (err, out)
     assert len(v.made("create_instance")) == 3 and not v.instances, v.calls
+
+
+@case
+def rent_test_prints_the_download_cost_of_the_pick():
+    """rent-test: the picked offer's line shows what downloading the weights costs there, apart from $/hr"""
+    ready = ("running", "", "[t] [boot] ORCH_READY model=x")
+    offers = [dict(THREE_HOSTS[0], inet_down_cost=0.0247), dict(THREE_HOSTS[1])]
+    v, out, err = rent_with_boots(ready, offers=offers, weight_bytes=18.7e9)
+    assert err is None, (err, out)
+    assert any(o.startswith("cheapest match: offer 777") and "+ $0.46 to download" in o for o in out), out
+    # an offer without inet_down_cost says so instead of claiming it's free
+    assert "price unknown" in deploy._offer_line(THREE_HOSTS[1], 18.7e9)
+    assert "download" not in deploy._offer_line(THREE_HOSTS[1])
+
+
+@case
+def rent_test_hold_on_fatal_sets_the_grace_for_that_rental_only():
+    """rent-test --hold-on-fatal 30 sets ORCH_FATAL_GRACE=1800 on the rental and says what it costs; without it, no override"""
+    bad = ("running", "", "[t] [boot] ORCH_FATAL: smoke test failed")
+    v, out, err = rent_with_boots(bad, offers=THREE_HOSTS, hold_on_fatal=30)
+    (_, _, kw), = v.made("create_instance")
+    assert "-e ORCH_FATAL_GRACE=1800" in kw["env"], kw["env"]
+    assert any(o.startswith("!! --hold-on-fatal 30") and "$0.160/hr" in o and "$0.08" in o
+               and "manual_ttl_s=14400" in o for o in out), out
+    assert err and "stops itself 30 min after the failure" in err, err
+    v, out, err = rent_with_boots(bad, offers=THREE_HOSTS)
+    (_, _, kw), = v.made("create_instance")
+    assert "ORCH_FATAL_GRACE" not in kw["env"] and not any(o.startswith("!!") for o in out), kw["env"]
+
+
+@case
+def rent_test_hold_on_fatal_is_bounded_by_manual_ttl():
+    """rent-test --hold-on-fatal longer than limits.manual_ttl_s, or not above 0, is refused before anything is rented"""
+    for hold in (241, 0, -5):
+        v, out, err = rent_with_boots(offers=THREE_HOSTS, hold_on_fatal=hold)
+        assert err and "--hold-on-fatal" in err and not v.made("create_instance"), (hold, err)
+    v, out, err = rent_with_boots(("running", "", "[t] [boot] ORCH_READY model=x"), offers=THREE_HOSTS,
+                                  hold_on_fatal=240)
+    assert err is None, err
 
 
 # ── watch ────────────────────────────────────────────────────────────────────
@@ -1049,7 +1147,7 @@ def confirm_without_terminal_stops_cleanly():
         v = FakeVast()
         deploy.vast = lambda: v
         real_check = deploy.check
-        deploy.check = lambda cfg, v=None: PINS
+        deploy.check = lambda cfg, v=None, facts=None: PINS
         try:
             raises(lambda: deploy.cmd_rent_test(BASE_CFG, args(yes=False)), SystemExit, "pass --yes")
         finally:
