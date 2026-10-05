@@ -6,7 +6,7 @@ Every file in DIR is served as repo "test/repo". With --corrupt NAME the Hub
 reports a wrong sha256 for that file, to exercise verification failure. With
 --slow SECS each download is spread over about SECS seconds. With
 --stall-once the first download sends half the file, then hangs. With
---no-ranges bounded range requests (header reads) get a 403.
+--no-ranges header reads (worker/vram.py's range requests) get a 403.
 """
 import hashlib
 import json
@@ -37,6 +37,14 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def handle(self):
+        # Clients hang up mid-body on purpose: a header read stops once it has
+        # the header, and stopped or restarted downloads drop their connection.
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_POST(self):
         if "/paths-info/" not in self.path:
             self.send_error(404)
@@ -61,32 +69,30 @@ class H(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         data = open(p, "rb").read()
-        start = 0
-        rng = self.headers.get("Range")
-        if rng and rng.startswith("bytes=") and rng.split("-", 1)[1].strip():
-            # A bounded range is a header read (worker/vram.py): served at once,
-            # never slowed or stalled, so the download knobs only affect downloads.
-            if NO_RANGES:
-                self.send_error(403)
-                return
-            a, b = (int(x) for x in rng[6:].split("-"))
-            body = data[a:b + 1]
-            self.send_response(206)
-            self.send_header("Content-Range", f"bytes {a}-{a + len(body) - 1}/{len(data)}")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        # Header reads by worker/vram.py (it names itself in User-Agent) are
+        # served at once, never slowed or stalled, so the download knobs only
+        # affect downloads (aria2c's ranged segments included).
+        header_read = self.headers.get("User-Agent", "").startswith("vastai-llmapi-orchestrator")
+        if header_read and NO_RANGES:
+            self.send_error(403)
             return
+        start, end = 0, len(data) - 1
+        rng = self.headers.get("Range")
         if rng and rng.startswith("bytes="):
-            start = int(rng[6:].split("-")[0] or 0)
+            a, _, b = rng[6:].partition("-")
+            start = int(a or 0)
+            end = min(int(b), end) if b.strip() else end
             self.send_response(206)
-            self.send_header("Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
         else:
             self.send_response(200)
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(len(data) - start))
+        self.send_header("Content-Length", str(end + 1 - start))
         self.end_headers()
-        body = data[start:]
+        body = data[start:end + 1]
+        if header_read:
+            self.wfile.write(body)
+            return
         if STALL["left"]:
             STALL["left"] -= 1
             self.wfile.write(body[:len(body) // 2])
