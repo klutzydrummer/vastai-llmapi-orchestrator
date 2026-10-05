@@ -203,9 +203,16 @@ class Shim:
             return web.json_response(_error_body(401, "unauthorized"), status=401)
 
         async def _go():
+            # With an embedding model the request goes to that llama-server,
+            # so waking a worker that is already up doesn't take a chat slot
+            # (and push a conversation's cached prompt out of it).
+            if self.cfg.embed_model_name:
+                route, body = "/v1/embeddings", {"model": self.cfg.embed_model_name, "input": "hi"}
+            else:
+                route, body = "/v1/completions", {"model": self.cfg.served_model_name, "prompt": "hi",
+                                                  "max_tokens": 1}
             try:
-                await self._dispatch("/v1/completions", {
-                    "model": self.cfg.served_model_name, "prompt": "hi", "max_tokens": 1}, False)
+                await self._dispatch(route, body, False)
                 log.info("wake: a worker is ready")
             except Exception as e:
                 log.warning("wake failed: %s", e)
