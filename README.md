@@ -304,6 +304,17 @@ shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
 
+**Warm hours.** Set `WARM_HOURS` (for example `14:30-23:00`) and `WARM_TZ` (for
+example `America/Chicago`) in `shim/.env`, and the shim keeps one worker
+awake during those hours: it sends a 1-token request every `WARM_PING_S`
+(300 s), under the endpoint's `inactivity_timeout`, so the worker is never
+released. It sends one at a time, so a ping waiting on a cold start isn't
+doubled up. Outside the hours nothing is sent and the worker idles out as usual. Start the window
+about 25 minutes before you need it, since the first ping pays the cold start.
+While warm, a worker bills its full rate (a 3090 at about $0.17/hr is about
+$1.40 for 8 hours). It's off by default; `GET /status` shows whether it's on
+and how the last ping went.
+
 ## Tuning
 
 - **Context:** `llama.ctx` is shared across `parallel` slots (`--kv-unified`),

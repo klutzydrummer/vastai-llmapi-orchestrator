@@ -16,6 +16,9 @@ Endpoints:
   GET  /status                                 worker states from the autoscaler
   GET  /health                                 the shim itself
 
+With WARM_HOURS set, the shim also keeps a worker awake during those hours
+(see Warm hours in config.example.env).
+
 Configuration is by environment variable; see config.example.env.
 """
 
@@ -24,7 +27,9 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
@@ -33,6 +38,36 @@ log = logging.getLogger("shim")
 
 def _env_bool(name, default):
     return os.environ.get(name, str(int(default))).strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_warm_hours(text):
+    """"15:00-23:00" or "06:30-08:00,15:00-23:00" -> [(start_min, end_min), ...].
+    A range may cross midnight ("22:00-02:00"). Empty -> [] (off)."""
+    out = []
+    for part in (p.strip() for p in (text or "").split(",")):
+        if not part:
+            continue
+        try:
+            a, b = part.split("-")
+            mins = []
+            for t in (a, b):
+                h, m = t.strip().split(":")
+                h, m = int(h), int(m)
+                if not (0 <= h <= 24 and 0 <= m < 60) or (h == 24 and m):
+                    raise ValueError
+                mins.append(h * 60 + m)
+        except ValueError:
+            raise SystemExit(f"WARM_HOURS: can't read {part!r}; use HH:MM-HH:MM, comma-separated")
+        if mins[0] == mins[1]:
+            raise SystemExit(f"WARM_HOURS: {part!r} is empty")
+        out.append((mins[0], mins[1]))
+    return out
+
+
+def in_warm_hours(windows, now):
+    """True when `now` (a datetime) falls inside any window."""
+    m = now.hour * 60 + now.minute
+    return any((a <= m < b) if a < b else (m >= a or m < b) for a, b in windows)
 
 
 @dataclass
@@ -51,6 +86,9 @@ class Config:
     nonstream_keepalive: bool = True
     fast_fail_window: float = 1.5
     max_retries: int = 3              # worker 5xx/429 retries before giving up
+    warm_hours: list = field(default_factory=list)   # [(start_min, end_min)]; empty = off
+    warm_tz: str = ""                 # IANA zone for warm_hours; empty = the machine's local time
+    warm_ping_s: float = 300.0        # how often to ping during warm hours; under inactivity_timeout
 
     @classmethod
     def from_env(cls):
@@ -72,7 +110,20 @@ class Config:
             default_cost=int(os.environ.get("DEFAULT_COST", "512")),
             nonstream_keepalive=_env_bool("NONSTREAM_KEEPALIVE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "3")),
-        )
+            warm_hours=parse_warm_hours(os.environ.get("WARM_HOURS", "")),
+            warm_tz=os.environ.get("WARM_TZ", "").strip(),
+            warm_ping_s=float(os.environ.get("WARM_PING_S", "300")),
+        ).checked()
+
+    def checked(self):
+        if self.warm_tz:
+            try:
+                ZoneInfo(self.warm_tz)
+            except Exception:
+                raise SystemExit(f"WARM_TZ: unknown time zone {self.warm_tz!r} (use an IANA name like America/Chicago)")
+        if not 0 < self.warm_ping_s < 900:
+            raise SystemExit("WARM_PING_S must be between 0 and 900 seconds (under the endpoint's inactivity_timeout)")
+        return self
 
 
 class UpstreamError(Exception):
@@ -93,6 +144,13 @@ class Shim:
         self._endpoint = endpoint
         self._endpoint_lock = asyncio.Lock()
         self.stats = {"requests": 0, "errors": 0, "last_wait_s": None, "last_ok_at": None}
+        self.warm = {"hours": os.environ.get("WARM_HOURS", "").strip() or None, "active": False,
+                     "pings": 0, "last_ping_at": None, "last_ping": None}
+        self._warm_task = self._warm_ping = None
+        self._tz = ZoneInfo(cfg.warm_tz) if cfg.warm_tz else None
+
+    def now(self):
+        return datetime.now(self._tz) if self._tz else datetime.now().astimezone()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def start(self, app):
@@ -100,8 +158,16 @@ class Shim:
             from vastai import CoroutineServerless
             self.client = CoroutineServerless(api_key=self.cfg.vast_api_key)
             await self.client.__aenter__()
+        if self.cfg.warm_hours:
+            if not self.cfg.warm_tz:
+                log.warning("WARM_TZ is not set; warm hours use this machine's clock (now %s). In Docker "
+                            "that is usually UTC", self.now().strftime("%H:%M %Z"))
+            self._warm_task = asyncio.create_task(self._warm_loop())
 
     async def stop(self, app):
+        for t in (self._warm_task, self._warm_ping):
+            if t is not None:
+                t.cancel()
         if self.client is not None:
             try:
                 await self.client.close()
@@ -119,6 +185,36 @@ class Shim:
                     raise UpstreamError(503, f"endpoint {self.cfg.endpoint_name!r} unavailable: {e}")
                 log.info("using endpoint %s", self._endpoint)
         return self._endpoint
+
+    # ── warm hours ───────────────────────────────────────────────────────────
+    async def _ping(self):
+        """One minimal request through the autoscaler: starts a worker if none
+        runs, and counts as activity so a running one isn't released."""
+        try:
+            await self._dispatch("/v1/completions", {
+                "model": self.cfg.served_model_name, "prompt": "hi", "max_tokens": 1}, False)
+            return "ok"
+        except Exception as e:
+            log.warning("warm ping failed: %s", e)
+            return f"failed: {e}"[:300]
+
+    async def _warm_loop(self):
+        """During warm hours, ping every warm_ping_s. A ping still waiting on a
+        cold start is never doubled up; outside the hours nothing is sent and
+        the worker idles out as usual."""
+        while True:
+            active = in_warm_hours(self.cfg.warm_hours, self.now())
+            if active != self.warm["active"]:
+                log.info("warm hours %s (%s)", "started" if active else "ended", self.warm["hours"])
+                self.warm["active"] = active
+            if self._warm_ping is not None and self._warm_ping.done():
+                self.warm["last_ping"] = self._warm_ping.result()
+                self._warm_ping = None
+            if active and self._warm_ping is None:
+                self.warm["last_ping_at"] = int(time.time())
+                self.warm["pings"] += 1
+                self._warm_ping = asyncio.create_task(self._ping())
+            await asyncio.sleep(self.cfg.warm_ping_s if active else min(60.0, self.cfg.warm_ping_s))
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _authorized(self, request):
@@ -190,7 +286,7 @@ class Shim:
     async def status(self, request):
         if not self._authorized(request):
             return web.json_response(_error_body(401, "unauthorized"), status=401)
-        out = {"endpoint": self.cfg.endpoint_name, "shim": self.stats}
+        out = {"endpoint": self.cfg.endpoint_name, "shim": self.stats, "warm": self.warm}
         try:
             workers = await self.client.get_endpoint_workers(await self.endpoint())
             out["workers"] = [asdict(w) for w in workers]
