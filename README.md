@@ -216,6 +216,14 @@ because of its host (stuck or erroring at Vast, or "weights download too slow
 on this host"), `rent-test` then destroys it and rents the next cheapest other
 host, up to `limits.rent_attempts` (3) rentals in all. Any other failure, such
 as a smoke test, is reported and the instance left for a look.
+
+`rent-test` searches offers again right before each rental, since the
+preflight can take minutes. If Vast refuses the rental, its answer is printed
+and the account is checked for an instance that appeared anyway (if one did,
+it stops and names it). If the offer is no longer listed, someone else took
+it: the next offer is tried, counting toward `rent_attempts`. If Vast refuses
+an offer that is still listed, it stops; nothing was rented.
+
 `rent-test --no-follow` only rents. `logs <id>` never destroys anything; it
 exits 1 and says how. If the boot runs out of time, the ORCH_FATAL line names
 the step it was stuck at. `logs <id> --once` prints what is there now without

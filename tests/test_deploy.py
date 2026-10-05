@@ -13,6 +13,8 @@ import time
 import tomllib
 import types
 
+import requests
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "deploy"))
 import deploy  # noqa: E402
 
@@ -55,6 +57,9 @@ class FakeVast:
         self.client = types.SimpleNamespace(post=self._post)
         self.offers = [{"id": 777, "machine_id": 1, "gpu_name": "RTX 4090", "dph_total": 0.31}]
         self.boot_plan = []        # per rental: (actual_status, status_msg, log text or exception)
+        self.create_errors = {}    # offer id -> (exception to raise, whether the offer then disappears,
+                                   #              whether an instance is created anyway)
+        self.offer_rounds = []     # successive search_offers answers, before falling back to self.offers
         self.boot_logs = {}
 
     def _id(self):
@@ -135,10 +140,19 @@ class FakeVast:
             self.instances = [i for i in self.instances if i["id"] != id]
 
     def search_offers(self, **kw):
+        if self.offer_rounds:
+            self.offers = self.offer_rounds.pop(0)
         return copy.deepcopy(self.offers[:kw.get("limit", 10)])
 
     def create_instance(self, offer, **kw):
         self.calls.append(("create_instance", offer, kw))
+        if offer in self.create_errors:
+            exc, gone, created = self.create_errors.pop(offer)
+            if gone:
+                self.offers = [o for o in self.offers if o["id"] != offer]
+            if created:
+                self.instances.append(inst(self._id(), label=kw.get("label")))
+            raise exc
         iid = self._id()
         row = inst(iid, label=kw.get("label"))
         if self.boot_plan:
@@ -534,8 +548,8 @@ def rent_test_records_the_id_vast_returns():
     assert [i["id"] for i in r["orphans"]] == [iid]
 
 
-def rent_with_boots(*boots, offers=None):
-    v = FakeVast()
+def rent_with_boots(*boots, offers=None, v=None):
+    v = v or FakeVast()
     if offers:
         v.offers = offers
     v.boot_plan = list(boots)
@@ -594,7 +608,70 @@ def rent_test_stops_after_rent_attempts():
     """rent-test: after limits.rent_attempts hosts fail it stops with nothing left running"""
     bad = ("loading", "Secrets fetch failed", RuntimeError("x"))
     v, out, err = rent_with_boots(bad, bad, bad, bad, offers=THREE_HOSTS + [dict(THREE_HOSTS[0], id=780, machine_id=4)])
-    assert err and "3 rentals failed" in err and "nothing is left running" in err, (err, out)
+    assert err and "3 attempts failed" in err and "nothing is left running" in err, (err, out)
+    assert len(v.made("create_instance")) == 3 and not v.instances, v.calls
+
+
+def vast_400(offer):
+    """What the vastai SDK raised on rental attempt for offer 50484116 (issue 16)."""
+    r = requests.Response()
+    r.status_code, r._content = 400, b'{"success": false, "error": "invalid_args", "msg": "offer no longer available"}'
+    r.url = f"https://console.vast.ai/api/v0/asks/{offer}/"
+    return requests.exceptions.HTTPError(f"400 Client Error: Bad Request for url: {r.url}", response=r)
+
+
+@case
+def rent_test_tries_the_next_offer_when_one_is_taken():
+    """rent-test: Vast refuses an offer that is then gone; Vast's answer is printed and the next offer is rented"""
+    ready = ("running", "", "[t] [boot] ORCH_READY model=x")
+    v = FakeVast()
+    v.create_errors = {777: (vast_400(777), True, False)}
+    v, out, err = rent_with_boots(ready, offers=THREE_HOSTS, v=v)
+    assert err is None, (err, out)
+    assert [c[1] for c in v.made("create_instance")] == [777, 778], v.calls
+    assert any("HTTP 400" in o and "offer no longer available" in o for o in out), out
+    assert any("no longer listed" in o and "nothing was rented" in o for o in out), out
+    assert set(deploy.load_state()["manual_instances"]) == {str(v.instances[0]["id"])}
+
+
+@case
+def rent_test_stops_when_a_listed_offer_is_refused():
+    """rent-test: Vast refuses an offer that is still listed; it stops with Vast's answer, nothing rented, no retry"""
+    v = FakeVast()
+    v.create_errors = {777: (vast_400(777), False, False)}
+    v, out, err = rent_with_boots(offers=THREE_HOSTS, v=v)
+    assert err and "still listed" in err and "offer no longer available" in err, (err, out)
+    assert len(v.made("create_instance")) == 1 and not v.instances, v.calls
+
+
+@case
+def rent_test_stops_when_a_refused_create_left_an_instance():
+    """rent-test: a create that errors but leaves a new instance on the account stops, names it, and is not retried"""
+    v = FakeVast()
+    v.create_errors = {777: (requests.exceptions.ConnectionError("reset"), True, True)}
+    v, out, err = rent_with_boots(offers=THREE_HOSTS, v=v)
+    assert err and "didn't have before" in err and str(v.instances[0]["id"]) in err, (err, out)
+    assert len(v.made("create_instance")) == 1 and not v.made("destroy_instance"), v.calls
+
+
+@case
+def rent_test_searches_again_right_before_renting():
+    """rent-test: the offer is re-searched after the prompt; a cheaper offer that went away is not rented"""
+    ready = ("running", "", "[t] [boot] ORCH_READY model=x")
+    v = FakeVast()
+    v.offer_rounds = [list(THREE_HOSTS), THREE_HOSTS[1:]]
+    v, out, err = rent_with_boots(ready, v=v)
+    assert err is None and [c[1] for c in v.made("create_instance")] == [778], (err, v.calls)
+    assert any("offers changed" in o for o in out), out
+
+
+@case
+def rent_test_counts_taken_offers_as_attempts():
+    """rent-test: offers taken one after another use up limits.rent_attempts, with nothing rented"""
+    v = FakeVast()
+    v.create_errors = {o["id"]: (vast_400(o["id"]), True, False) for o in THREE_HOSTS}
+    v, out, err = rent_with_boots(offers=THREE_HOSTS + [dict(THREE_HOSTS[0], id=780, machine_id=4, dph_total=0.19)], v=v)
+    assert err and "3 attempts failed" in err and "offer 779 taken" in err, (err, out)
     assert len(v.made("create_instance")) == 3 and not v.instances, v.calls
 
 
