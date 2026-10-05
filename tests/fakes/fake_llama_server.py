@@ -13,6 +13,7 @@ Behaviour knobs (env):
   FAKE_EMBED_MODE  ok (default) | zero (all-zero vectors) | crash (the
                    --embedding server exits during load)
   FAKE_EMBED_LOAD_SECS  load time of the --embedding server (default: as above)
+  FAKE_NO_REASONING_FLAG  set: --help doesn't list --reasoning (older llama.cpp)
   FAKE_EVENTS      file to append "start chat|embed" and "healthy chat|embed"
                    to, so tests can check the order servers came up in
 """
@@ -39,6 +40,8 @@ HELP = """usage: llama-server [options]
 --chat-template-kwargs STRING
 --no-webui
 """
+if not os.environ.get("FAKE_NO_REASONING_FLAG"):
+    HELP += "-rea, --reasoning [on|off|auto]\n"
 
 argv = sys.argv[1:]
 MODE_EARLY = os.environ.get("FAKE_LLAMA_MODE", "ok")
