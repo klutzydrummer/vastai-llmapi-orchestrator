@@ -189,6 +189,15 @@ async def main():
         assert len(d["data"]) == 2 and d["data"][1]["embedding"] == [0.1, 0.2], d
         assert fake.received[-1]["model"] == "qwen3-embed" and "stream" not in fake.received[-1]
         assert s._cost({"input": "x" * 400}) == 100
+        # /wake uses the embedding model, leaving the chat model's slots alone
+        n0 = len(fake.received)
+        async with http.post(base + "/wake") as r:
+            assert r.status == 202
+        for _ in range(20):
+            if len(fake.received) > n0:
+                break
+            await asyncio.sleep(0.1)
+        assert fake.received[n0:] == [{"model": "qwen3-embed", "input": "hi"}], fake.received[n0:]
     ok("/v1/embeddings reaches the worker with the embedding model's name")
     await runner.cleanup()
 

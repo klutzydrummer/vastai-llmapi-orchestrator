@@ -40,6 +40,8 @@ import threading
 import time
 import tomllib
 import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -159,6 +161,16 @@ def check_limits(cfg):
         val = cfg[section].get(key)
         if not isinstance(val, int) or isinstance(val, bool) or val < 0:
             raise CheckFailed(f"{section}.{key} must be set to a whole number (Vast's default is much higher)")
+    parse_warm_hours(e.get("warm_hours", ""))
+    if e.get("warm_tz"):
+        try:
+            ZoneInfo(e["warm_tz"])
+        except Exception:
+            raise CheckFailed(f"endpoint.warm_tz: unknown time zone {e['warm_tz']!r} "
+                              "(use an IANA name like \"America/Chicago\")")
+    wml = e.get("warm_min_load", 1)
+    if isinstance(wml, bool) or not isinstance(wml, (int, float)) or wml <= 0:
+        raise CheckFailed("endpoint.warm_min_load must be a number above 0")
     if lim.get("on_breach", "pause") not in ("pause", "alert"):
         raise CheckFailed("limits.on_breach must be \"pause\" or \"alert\"")
     ra = lim.get("rent_attempts", 3)
@@ -574,10 +586,54 @@ def verify_workergroup(v, wg_id, want):
     return _verify(next((r for r in rows if r.get("id") == wg_id), None), want, f"workergroup {wg_id}")
 
 
-def endpoint_limits(cfg):
+def parse_warm_hours(text):
+    """"15:00-23:00" or "06:30-08:00,15:00-23:00" -> [(start_min, end_min), ...].
+    A range may cross midnight ("22:00-02:00"). Empty -> [] (off)."""
+    out = []
+    for part in (p.strip() for p in (text or "").split(",")):
+        if not part:
+            continue
+        try:
+            a, b = part.split("-")
+            mins = []
+            for t in (a, b):
+                h, m = (int(x) for x in t.strip().split(":"))
+                if not (0 <= h <= 24 and 0 <= m < 60) or (h == 24 and m):
+                    raise ValueError
+                mins.append(h * 60 + m)
+        except ValueError:
+            raise CheckFailed(f"endpoint.warm_hours: can't read {part!r}; use \"HH:MM-HH:MM\", comma-separated")
+        if mins[0] == mins[1]:
+            raise CheckFailed(f"endpoint.warm_hours: {part!r} is empty")
+        out.append((mins[0], mins[1]))
+    return out
+
+
+def warm_now(cfg, now=None):
+    """Whether endpoint.warm_hours covers `now` (epoch seconds), in
+    endpoint.warm_tz (the machine's clock when unset)."""
     e = cfg["endpoint"]
-    return {k: e[k] for k in ("max_workers", "cold_workers", "min_load", "target_util",
-                              "cold_mult", "inactivity_timeout") if k in e}
+    windows = parse_warm_hours(e.get("warm_hours", ""))
+    if not windows:
+        return False
+    tz = ZoneInfo(e["warm_tz"]) if e.get("warm_tz") else None
+    t = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    m = t.hour * 60 + t.minute
+    return any((a <= m < b) if a < b else (m >= a or m < b) for a, b in windows)
+
+
+def endpoint_limits(cfg, now=None):
+    """The endpoint settings to send now. During endpoint.warm_hours,
+    min_load is endpoint.warm_min_load: the autoscaler then keeps a worker
+    running with no traffic, instead of releasing it after
+    inactivity_timeout. Every write (apply, pause, resume, watch) goes
+    through here, so none of them undoes the other."""
+    e = cfg["endpoint"]
+    out = {k: e[k] for k in ("max_workers", "cold_workers", "min_load", "target_util",
+                             "cold_mult", "inactivity_timeout") if k in e}
+    if warm_now(cfg, now):
+        out["min_load"] = e.get("warm_min_load", 1)
+    return out
 
 
 # ── instances ────────────────────────────────────────────────────────────────
@@ -1360,7 +1416,23 @@ def watch_tick(v, cfg, st, now=None):
             st["seen_workers"].pop(str(i), None)
             st["manual_instances"].pop(str(i), None)
 
-    # 3. Whole-account spend, from Vast's own dph_total, against the budget.
+    # 3. Warm hours: hold min_load up during them so the autoscaler keeps a
+    #    worker running, and put it back after. Written on each change of
+    #    window, or when Vast reports a value we didn't set, and read back.
+    configured = bool(cfg["endpoint"].get("warm_hours"))
+    if ep and (configured or "warm_active" in st):
+        active = warm_now(cfg, now)
+        want = endpoint_limits(cfg, now)
+        reported = ep.get("min_load")
+        if st.get("warm_active") != active or (reported is not None and not _same(reported, want["min_load"])):
+            v.update_endpoint(ep["id"], endpoint_name=cfg["endpoint"]["name"], **want)
+            verify_endpoint(v, ep["id"], want)
+            st["warm_active"] = active
+            actions.append(f"warm hours {'on' if active else 'off'}: endpoint min_load={want['min_load']}")
+        if not configured:   # warm_hours removed from the config: reverted above, now forget it
+            st.pop("warm_active", None)
+
+    # 4. Whole-account spend, from Vast's own dph_total, against the budget.
     budget = float(cfg["limits"]["max_hourly_usd"])
     running = [i for i in r["workers"] + r["manual"] + r["young"] + r["unattributed"]
                if i.get("id") not in targets and _status(i) == "running"]

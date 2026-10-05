@@ -46,6 +46,9 @@ min_load           = 0       # 0 = allow scaling to zero running workers
 target_util        = 0.9
 cold_mult          = 1.0
 inactivity_timeout = 900     # seconds idle before workers are released; verify in the dashboard
+warm_hours         = ""      # e.g. "14:30-23:00": watch keeps a worker running then; "" = off
+warm_tz            = ""      # IANA zone for warm_hours, e.g. "America/Chicago"; "" = machine clock (UTC in Docker)
+warm_min_load      = 1       # min_load during warm_hours; above 0 asks the autoscaler to keep a worker up
 
 [workergroup]
 test_workers  = 1            # instances spun up to benchmark a new hardware type (default 3)

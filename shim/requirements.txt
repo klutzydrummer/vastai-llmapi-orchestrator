@@ -1,2 +1,3 @@
 vastai==1.8.3
 aiohttp>=3.9
+tzdata                # zone data for WARM_TZ where the OS has none
