@@ -34,7 +34,7 @@ the autoscaler drops that worker instead of billing for it.
 | download | file exists at the **pinned commit** on the Hub; enough disk; after 90 s, the projected finish at the last minute's speed is within `download_max_s` | fatal (a download with no data for 2 minutes is restarted first) |
 | verify | size + **sha256 match the Hub's LFS hash**; GGUF magic bytes | file deleted, fatal |
 | load | the embedding server, then the chat server (sized from the memory left), stay alive and `/health` goes 200 within `load_timeout_s` | fatal, with llama-server's own error line |
-| smoke test | `/props` reports vision on; a text request and a **real image request** both return a clean answer (no chat-template tokens such as `<|thought|>`, no leading role name such as `user\n`; the raw reply and the prompt the template built are logged when one is refused); with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
+| smoke test | `/props` reports vision on; a text request and a **real image request** both return a clean answer (no chat-template tokens such as `<\|thought\|>`, no leading role name such as `user\n`; the raw reply and the prompt the template built are logged when one is refused); with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
 | deadline | the boot, not counting the download, finishes within `deadline_s` | fatal, naming the step it was stuck at |
 | serving | `llama-server` exits later | fatal |
 | after fatal | no PyWorker left to report it, `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
