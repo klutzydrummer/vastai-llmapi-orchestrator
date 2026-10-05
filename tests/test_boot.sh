@@ -91,6 +91,10 @@ check "fetch output reaches the container console" grep -q "\[fetch\] all files 
 grep -q -- "--mmproj" "$LAST_LOG" && grep -q -- "--kv-unified" "$LAST_LOG" \
     && echo "PASS  llama-server got --mmproj and --kv-unified" && PASS=$((PASS+1)) \
     || { echo "FAIL  expected flags missing"; FAIL=$((FAIL+1)); }
+check "reasoning_budget 0 turns thinking off in the template" grep -qF -- "--reasoning off" "$LAST_LOG"
+run_case "older llama.cpp without --reasoning" ready 60 FAKE_NO_REASONING_FLAG=1
+check "falls back to the template kwarg" \
+    grep -qF -- '--chat-template-kwargs {"enable_thinking":false}' "$LAST_LOG"
 
 run_case "cold restart reuses verified weights" ready 60
 grep -q "already verified, skipping" "$LAST_LOG" \
@@ -126,6 +130,7 @@ check "logs the prompt the template built" grep -q "prompt the template built en
 run_case "image reply starts with a role name" fatal 30 FAKE_LLAMA_MODE=roleleak
 check "names the role prefix" grep -q "answer starts with a role name ('user')" "$LAST_LOG"
 run_case "thinking model still thinking at max_tokens" ready 30 FAKE_LLAMA_MODE=thinking LLAMA_REASONING_BUDGET=-1
+check "thinking on leaves the template alone" bash -c '! grep -Eq -- "--chat-template-kwargs|--reasoning off" "$1"' _ "$LAST_LOG"
 run_case "reasoning only with thinking off" fatal 30 FAKE_LLAMA_MODE=thinking LLAMA_REASONING_BUDGET=0
 run_case "boot deadline" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
 check "deadline failure names the step it was stuck at" grep -q "not ready within 6s (still at: loading the model)" "$LAST_LOG"

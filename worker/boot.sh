@@ -480,6 +480,15 @@ has "--kv-unified"       && args+=(--kv-unified)
 has "--flash-attn"       && args+=(-fa on)
 has "--jinja"            && args+=(--jinja)
 has "--reasoning-budget" && args+=(--reasoning-budget "${LLAMA_REASONING_BUDGET:-0}")
+# A budget of 0 alone leaves thinking on in templates that open every prompt
+# with a think turn (WaifuGemma4: the reply is often just '<|thought|>',
+# rental 54351312), so turn it off in the template too. Newer llama.cpp has
+# --reasoning off for this and deprecates the template kwarg.
+if [ "${LLAMA_REASONING_BUDGET:-0}" = 0 ]; then
+    if has "--reasoning \[on"; then args+=(--reasoning off)
+    elif has "--chat-template-kwargs"; then args+=(--chat-template-kwargs '{"enable_thinking":false}')
+    fi
+fi
 has "--no-webui"         && args+=(--no-webui)
 # LLAMA_EXTRA_ARGS: whitespace- or ';'-separated, since Vast env values can't
 # always carry spaces.
