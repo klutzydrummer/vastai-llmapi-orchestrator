@@ -171,9 +171,18 @@ Keep `ENDPOINT_NAME`, `SERVED_MODEL_NAME` and `EMBED_MODEL_NAME` in
 cp deploy/config.example.toml deploy/config.toml   # do this before compose, or Docker
 cp shim/config.example.env shim/.env               # mounts an empty directory instead
 # fill in both: VAST_API_KEY, SHIM_API_KEY, endpoint/model names, [limits]
-docker compose build
+docker compose pull                                # the published image, latest main
 alias orch='docker compose run --rm deploy'        # orch check, orch apply, ...
 ```
+
+Every push to `main` publishes the image to
+`ghcr.io/klutzydrummer/vastai-llmapi-orchestrator`, tagged `latest` and
+`sha-<commit>`, after the offline tests pass in the same build
+(`.github/workflows/image.yml`). To update, `docker compose pull && docker
+compose up -d`. To run your own checkout instead, `docker compose build` (or
+`up -d --build`); it builds under the same name, so the next `pull` replaces
+it with `main` again. To stay on one version, set `image:` in `compose.yaml`
+to a `sha-` tag.
 
 Commands that rent or delete something (`rent-test`, `destroy`, `sweep
 --destroy`) ask first. `docker compose run` attaches a terminal, so you can
@@ -302,16 +311,16 @@ docker compose logs -f watch               # "[watch]" lines show every action i
 Both containers stay up with `restart: unless-stopped`. Stopping the watchdog
 container mid-check is safe: its state lock is an flock the kernel drops.
 
-On NixOS, the same image works with `virtualisation.oci-containers`. The image
-is only built locally, never pulled, so build it with the same engine as
-`virtualisation.oci-containers.backend` (`docker build -t
-vastai-llmapi-orchestrator .`, or `podman build` for the podman default) before
-the first `nixos-rebuild switch`, and again after each `git pull`:
+On NixOS, the same image works with `virtualisation.oci-containers`, which
+pulls it on the first `nixos-rebuild switch`. It does not pull again on its
+own, so to update, pull `latest` with the backend's engine (`podman pull
+ghcr.io/klutzydrummer/vastai-llmapi-orchestrator:latest`, or `docker pull`)
+and restart the two services, or pin `image` to a `sha-` tag and change it:
 
 ```nix
 virtualisation.oci-containers.containers = let
   orch = cmd: {
-    image = "vastai-llmapi-orchestrator:latest";
+    image = "ghcr.io/klutzydrummer/vastai-llmapi-orchestrator:latest";
     cmd = cmd;
     # Quoted strings, not Nix paths: an unquoted /etc/... path is copied into
     # the world-readable /nix/store (or fails in pure flake evaluation), and
