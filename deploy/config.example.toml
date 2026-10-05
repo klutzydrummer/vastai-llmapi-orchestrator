@@ -62,18 +62,24 @@ test_workers  = 1            # instances spun up to benchmark a new hardware typ
 gpu_ram       = 40
 # Your constraints live here: price ceiling (dph_total), VRAM floor (gpu_ram),
 # CUDA driver floor for the image (cuda_max_good), GPU generation (compute_cap),
-# download speed (inet_down). The server-cuda image (CUDA 12.8) ships compiled
-# code for Ampere 8.6, Ada 8.9 and Blackwell 12.0, and PTX that the driver
-# JIT-compiles on first start for the rest (Turing 7.5, A100 8.0, ...).
+# download speed (inet_down), download price (inet_down_cost). The
+# server-cuda image (CUDA 12.8) ships compiled code for Ampere 8.6, Ada 8.9 and
+# Blackwell 12.0, and PTX that the driver JIT-compiles on first start for the
+# rest (Turing 7.5, A100 8.0, ...).
 # compute_cap (x100) >= 800 keeps to Ampere and newer: older cards (P40, V100,
 # Turing) lack features or have no prebuilt kernels, so their first load
 # JIT-compiles for many minutes.
-search_params = "num_gpus=1 gpu_ram>=40 dph_total<=0.60 cuda_max_good>=12.8 compute_cap>=800 inet_down>=500 reliability>0.98 direct_port_count>=1"
+# inet_down_cost is $/GB downloaded. Vast bills it on top of dph_total (which
+# is GPU + disk only), and every cold start downloads the weights again
+# (~31 GB here), so <=0.01 caps that at $0.31 per cold start. Hosts that
+# match the rest of this search charge $0.00 to about $1.00 for it.
+search_params = "num_gpus=1 gpu_ram>=40 dph_total<=0.60 cuda_max_good>=12.8 compute_cap>=800 inet_down>=500 reliability>0.98 direct_port_count>=1 inet_down_cost<=0.01"
 
 [limits]
 # `check` (and so `apply`) refuses configs that could spend more than this.
 # Worst case = (endpoint.max_workers + workergroup.test_workers) x the
-# dph_total<= ceiling in search_params. Here: (1 + 1) x 0.60 = 1.20.
+# dph_total<= ceiling in search_params (GPU + disk; downloads are billed
+# apart, see inet_down_cost above). Here: (1 + 1) x 0.60 = 1.20.
 max_hourly_usd  = 1.20
 max_workers_cap = 2          # endpoint.max_workers may not exceed this
 on_breach       = "pause"    # watch: pause the endpoint when the account's running $/hr exceeds max_hourly_usd ("alert" = log only)
