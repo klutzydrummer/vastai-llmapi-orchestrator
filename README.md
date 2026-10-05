@@ -99,7 +99,9 @@ itself reports, never on an inference:
 - **`deploy.py watch`** runs at home next to the shim (see
   `deploy/orch-watch.service`). Every minute it destroys workers Vast still
   reports as booting (`CREATING`/`LOADING`/`STARTING`…, all billed) more than
-  `boot.deadline_s + boot.download_max_s + limits.stuck_grace_s` after it first saw them, destroys
+  `boot.deadline_s + boot.download_max_s + limits.stuck_grace_s` after it first saw them,
+  destroys `rent-test` instances Vast still reports as booting (no container
+  yet) `limits.stuck_grace_s` after they were rented, destroys
   recorded orphans, and pauses the endpoint if the account's running $/hr, as
   Vast reports it, exceeds `limits.max_hourly_usd`. Worker statuses it doesn't
   recognise and unrecorded instances are reported, never acted on.
@@ -186,15 +188,35 @@ alias orch='python3 deploy/deploy.py'
 ### 1. Prove it on one test rental first (recommended)
 
 ```bash
-orch rent-test        # cheapest matching offer, no serverless; records the id
-orch logs <id>        # follows the boot until ORCH_READY (exit 0) or ORCH_FATAL (exit 1)
+orch rent-test        # cheapest matching offer, no serverless; records the id, follows the boot
+orch logs <id>        # follows an instance's boot until ORCH_READY (exit 0) or a failure (exit 1)
 ```
 
-`logs <id>` reads the container log through Vast (`vastai logs <id>` shows the
-same lines): each boot step, download progress every 30 s, a line a minute
-while the model loads, and the final marker. If the boot runs out of time, the
-ORCH_FATAL line names the step it was stuck at. `--once` prints what is there
-now without waiting.
+Following a boot (`rent-test`, or `logs <id>`) does two things at once:
+
+- **The container log** is fetched in the background from the start
+  (`vastai logs <id>` shows the same lines): each boot step, download progress
+  every 30 s, a line a minute while the model loads, and the final marker.
+- **Vast's own report** on the instance (`actual_status` and `status_msg`) is
+  read every 20 s and decides whether the boot is still valid. It is printed
+  when it changes, and repeated about once a minute while nothing new arrives.
+  The boot has failed when Vast lists the instance as gone, when Vast reports
+  an error (for example "Secrets fetch failed") for a minute while the
+  container hasn't started, or when the instance is still booting at Vast
+  (image pull, container start) `limits.stuck_grace_s` (10 min) after it was
+  rented. Our own boot (downloads, model load) runs after Vast reports the
+  container running and has its own limits.
+
+When a boot fails, the log so far is fetched one last time and saved with
+Vast's last report under `boots/<id>.log` next to `state.json`. If it failed
+because of its host (stuck or erroring at Vast, or "weights download too slow
+on this host"), `rent-test` then destroys it and rents the next cheapest other
+host, up to `limits.rent_attempts` (3) rentals in all. Any other failure, such
+as a smoke test, is reported and the instance left for a look.
+`rent-test --no-follow` only rents. `logs <id>` never destroys anything; it
+exits 1 and says how. If the boot runs out of time, the ORCH_FATAL line names
+the step it was stuck at. `logs <id> --once` prints what is there now without
+waiting.
 
 For the full log, including llama-server's own output, on the instance
 (`vastai ssh-url <id>`):
@@ -312,7 +334,7 @@ own limits instead of eating the boot deadline:
   file and the ones after it) at the speed of the last minute. Only if that
   misses the budget does the boot fail, right away, with "weights download too
   slow on this host", instead of billing until the budget runs out. The
-  autoscaler (or your next `rent-test`) can pick another host. The log line
+  autoscaler (or `rent-test`, by itself) can pick another host. The log line
   at the start says what average speed the budget needs (about 4.7 MB/s for
   17 GB in an hour).
 - The last minute's speed, not the average from the start, because downloads
