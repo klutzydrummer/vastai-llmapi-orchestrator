@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import tomllib
 import urllib.parse
@@ -160,6 +161,9 @@ def check_limits(cfg):
             raise CheckFailed(f"{section}.{key} must be set to a whole number (Vast's default is much higher)")
     if lim.get("on_breach", "pause") not in ("pause", "alert"):
         raise CheckFailed("limits.on_breach must be \"pause\" or \"alert\"")
+    ra = lim.get("rent_attempts", 3)
+    if not isinstance(ra, int) or isinstance(ra, bool) or not 1 <= ra <= 10:
+        raise CheckFailed("limits.rent_attempts must be a whole number from 1 to 10")
     if e["max_workers"] < 1:
         raise CheckFailed("endpoint.max_workers must be at least 1")
     cap = lim.get("max_workers_cap", 2)
@@ -584,6 +588,7 @@ def endpoint_limits(cfg):
 # Vast lists that isn't recorded is "unattributed": shown with its cost, and
 # destroyed only when named explicitly (sweep --destroy ID).
 BOOTING = {"creating", "created", "pending", "loading", "model_loading", "starting"}
+GONE = {"exited", "stopped", "offline", "destroyed"}
 
 
 def _dph(inst):
@@ -597,10 +602,63 @@ def _status(inst):
     return str(inst.get("actual_status") or inst.get("cur_state") or "?")
 
 
+def _status_msg(inst):
+    return " ".join(str(inst.get("status_msg") or "").split())[:300]
+
+
 def _describe(inst, note=""):
+    msg = _status_msg(inst)
     return (f"instance {inst.get('id')}: {_status(inst)}, {inst.get('gpu_name', '?')}, "
             f"${_dph(inst):.3f}/hr" + (f", label {inst['label']!r}" if inst.get("label") else "")
-            + (f" ({note})" if note else ""))
+            + (f", Vast says {msg!r}" if msg else "") + (f" ({note})" if note else ""))
+
+
+# Words in Vast's status_msg that mean the container failed to start (seen:
+# "Secrets fetch failed: network/subprocess error", stuck in loading 47 min).
+VAST_ERROR = re.compile(r"\b(error|errors|failed|failure|unable|cannot|denied|no such)\b", re.I)
+
+
+def vast_error(inst):
+    """Vast's status message when it reports a failure for an instance whose
+    container isn't running yet, else ""."""
+    msg = _status_msg(inst)
+    return msg if msg and _status(inst).lower() in BOOTING and VAST_ERROR.search(msg) else ""
+
+
+def boot_state(inst, booting_for, stuck_s):
+    """Classify one instance from what Vast reports for it (actual_status,
+    status_msg) and how long it has been in a booting status. Returns
+    (state, detail), state being one of:
+
+      "gone"     not listed, or exited/stopped/offline/destroyed
+      "running"  the container runs; its log is where to look next
+      "error"    still booting, and Vast's message reports a failure
+      "stuck"    still booting after stuck_s (0 = never)
+      "booting"  still booting, within stuck_s
+      "unknown"  a status this tool doesn't know: reported, never acted on
+    """
+    if not inst:
+        return "gone", "not listed by Vast"
+    status, msg = _status(inst).lower(), _status_msg(inst)
+    detail = f"{status}" + (f", Vast says {msg!r}" if msg else "")
+    if status in GONE:
+        return "gone", detail
+    if status == "running":
+        return "running", detail
+    if status not in BOOTING:
+        return "unknown", detail
+    if stuck_s and booting_for >= stuck_s:
+        return "stuck", detail
+    if vast_error(inst):
+        return "error", detail
+    return "booting", detail
+
+
+def booting_limit_s(cfg):
+    """How long a test rental may sit in a Vast booting state (image pull,
+    container start) before it counts as stuck. Our own boot (downloads,
+    model load) runs after Vast reports it running, so it isn't counted."""
+    return cfg.get("limits", {}).get("stuck_grace_s", 600)
 
 
 def endpoint_workers(v, endpoint_id):
@@ -633,14 +691,24 @@ def survey(v, cfg, st, ep, min_age, now=None):
     for k in [k for k in manual if k not in listed and now - manual[k].get("created_at", 0) > 600]:
         del manual[k]
     ttl = cfg.get("limits", {}).get("manual_ttl_s", 14400)
-    out = {"workers": [], "manual": [], "orphans": [], "young": [], "unattributed": [], "worker_rows": workers}
+    stuck_s = booting_limit_s(cfg)
+    out = {"workers": [], "manual": [], "orphans": [], "young": [], "unattributed": [], "worker_rows": workers,
+           "why": {}}
     for i in instances:
         key = str(i.get("id"))
         if i.get("id") in live:
             out["workers"].append(i)
         elif key in manual:
             age = now - manual[key].get("created_at", now)
-            (out["orphans"] if ttl and age >= ttl else out["manual"]).append(i)
+            if ttl and age >= ttl:
+                out["orphans"].append(i)
+                out["why"][i.get("id")] = f"test rental past manual_ttl_s={ttl}"
+            elif boot_state(i, age, stuck_s)[0] == "stuck":
+                # Vast never started its container; it bills meanwhile.
+                out["orphans"].append(i)
+                out["why"][i.get("id")] = f"test rental still {_status(i)} after {age / 60:.0f} min"
+            else:
+                out["manual"].append(i)
         elif key in seen:
             # Was a worker of ours, isn't one now.
             (out["orphans"] if now - seen[key] >= min_age else out["young"]).append(i)
@@ -819,7 +887,7 @@ def _report(r):
         if r[key]:
             say(f"{label}:")
             for i in r[key]:
-                say(f"  {_describe(i)}")
+                say(f"  {_describe(i, r.get('why', {}).get(i.get('id'), ''))}")
     mine = r["workers"] + r["manual"] + r["orphans"] + r["young"]
     say(f"this deployment: {len(mine)} instance(s), ${sum(_dph(i) for i in mine):.3f}/hr")
     if r["unattributed"]:
@@ -895,7 +963,9 @@ def cmd_sweep(cfg, args):
 
 
 LOGS_POLL_S = 20
-GONE = {"exited", "stopped", "offline", "destroyed"}
+STATUS_EVERY_S = 60          # logs ID: repeat a status line this often while nothing new is printed
+VAST_ERROR_CONFIRM_S = 60    # logs ID: an error in Vast's status message must last this long
+LOG_FINISH_S = 60            # how long a log fetch in flight may take to finish before we move on
 
 
 def _log_text(out):
@@ -907,40 +977,154 @@ def _log_text(out):
     return str(out)
 
 
-def follow_instance_logs(v, iid, timeout, once=False, poll=LOGS_POLL_S):
-    """Print an instance's container log as it grows until a boot marker shows
-    up. Returns "ready", "fatal", "gone", "timeout" or "once"."""
-    seen, t0, note = set(), time.time(), None
-    while True:
+class LogStream(threading.Thread):
+    """Fetches one instance's container log in the background from the moment
+    following starts, whatever state the instance is in: prints each new line
+    once, keeps them all, and notes the first boot marker. Only this thread
+    calls `v` (give it its own client)."""
+
+    def __init__(self, v, iid, poll):
+        super().__init__(daemon=True)
+        self.v, self.iid, self.poll = v, iid, poll
+        self.lines, self.marker, self.fatal_line, self.note = [], None, "", None
+        self._seen, self._stop_ev, self._lock = set(), threading.Event(), threading.Lock()
+
+    def fetch(self):
         try:
-            text = _log_text(v.logs(iid, tail="1000"))
-        except Exception as e:   # a log request that isn't ready yet is normal early on
-            text, msg = "", f"no log from Vast yet ({type(e).__name__}: {str(e)[:200]})"
-            if msg != note:
-                say(msg)
-                note = msg
-        marker = None
-        for line in text.splitlines():
-            if line in seen:
-                continue
-            seen.add(line)
-            say(line)
-            if "ORCH_FATAL:" in line:
-                marker = marker or "fatal"
-            elif "ORCH_READY model=" in line:
-                marker = marker or "ready"
-        if marker or once:
-            return marker or "once"
-        inst = v.show_instance(iid)
-        status = str((inst or {}).get("actual_status") or "").lower()
-        if not inst or status in GONE:
-            say(f"instance {iid} is {status or 'gone'} and printed no ORCH_READY or ORCH_FATAL")
-            return "gone"
-        if time.time() - t0 >= timeout:
-            say(f"no ORCH_READY or ORCH_FATAL from instance {iid} within {timeout:.0f}s "
-                f"(status {status or 'unknown'}); the full boot log is /workspace/orch/model.log on it")
-            return "timeout"
-        time.sleep(poll)
+            text = _log_text(self.v.logs(self.iid, tail="1000"))
+        except Exception as e:   # no log until the container runs; that's normal early on
+            note = f"no log from Vast yet ({type(e).__name__}: {str(e)[:120]})"
+            if note != self.note:
+                self.note = note
+                say(note)
+            return
+        with self._lock:
+            for line in text.splitlines():
+                if line in self._seen:
+                    continue
+                self._seen.add(line)
+                self.lines.append(line)
+                say(line)
+                if "ORCH_FATAL:" in line and not self.marker:
+                    self.marker, self.fatal_line = "fatal", line
+                elif "ORCH_READY model=" in line and not self.marker:
+                    self.marker = "ready"
+
+    def run(self):
+        while not self._stop_ev.is_set() and not self.marker:
+            self.fetch()
+            self._stop_ev.wait(self.poll)
+
+    def finish(self, wait=LOG_FINISH_S):
+        """Stop, letting a fetch in flight complete, then take one last copy:
+        why a boot failed is usually in its last lines."""
+        self._stop_ev.set()
+        if self.ident is None:   # never started (logs --once fetched by hand)
+            return
+        if self.is_alive():
+            self.join(wait)
+        if not self.is_alive():
+            self.fetch()
+
+
+def follow_instance_logs(v, iid, timeout, once=False, poll=None, stuck_s=600, since=None,
+                         clock=time.time, log_v=None):
+    """Follow one instance's boot. The container log streams in the
+    background (LogStream, on log_v) from the start; meanwhile this loop reads
+    what Vast reports for the instance (show_instance) and classifies it with
+    boot_state, which needs only actual_status, status_msg and how long it
+    has been booting.
+
+    Returns (result, boot): result is "ready", "fatal", "gone", "vast_error",
+    "stuck", "timeout" or "once"; boot holds the log lines, the ORCH_FATAL
+    line if any and the last instance row Vast gave. The log stream has
+    finished (with a last fetch) before this returns.
+
+    "vast_error": Vast's status message has reported a failure for
+    VAST_ERROR_CONFIRM_S while the container still isn't running. "stuck":
+    Vast has reported the instance booting for stuck_s since `since` (when it
+    was rented, if known, else when we first saw it booting)."""
+    poll = LOGS_POLL_S if poll is None else poll
+    stream, t0 = LogStream(log_v or v, iid, poll), clock()
+    booting_since = min(since, t0) if since else None
+    last_said, last_line, error_since, last_count, inst = t0, None, None, 0, None
+    result, verdict = None, ""
+    if once:
+        stream.fetch()
+    else:
+        stream.start()
+    try:
+        while result is None:
+            if stream.marker:
+                result = stream.marker
+                break
+            try:
+                inst, known = v.show_instance(iid), True
+            except Exception as e:   # not knowing is not "gone": say so and ask again
+                say(f"could not read instance {iid} from Vast ({type(e).__name__}: {str(e)[:200]}); retrying")
+                known = False
+            now = clock()
+            if known:
+                status = _status(inst).lower() if inst else ""
+                booting_since = (booting_since or now) if status in BOOTING else None
+                state, detail = boot_state(inst, now - booting_since if booting_since else 0, stuck_s)
+                line = f"[vast] instance {iid}: {detail}"
+                error_since = (error_since or now) if state == "error" else None
+                if state == "gone":
+                    result, verdict = "gone", (f"instance {iid} is {status or 'not listed'} and printed no "
+                                               "ORCH_READY or ORCH_FATAL")
+                elif state == "stuck":
+                    result, verdict = "stuck", (
+                        f"{line}. No container after {(now - booting_since) / 60:.0f} min "
+                        f"(limits.stuck_grace_s={stuck_s}); it still bills")
+                elif state == "error" and now - error_since >= VAST_ERROR_CONFIRM_S:
+                    result, verdict = "vast_error", (f"{line}. Vast reports an error and never started the "
+                                                     "container; it still bills")
+                elif line != last_line:
+                    say(line)
+                    last_line, last_said = line, now
+                if result:
+                    break
+            if once:
+                result = stream.marker or "once"
+                break
+            now = clock()
+            if len(stream.lines) != last_count:
+                last_count, last_said = len(stream.lines), now
+            elif now - last_said >= STATUS_EVERY_S:
+                say(f"still waiting, {(now - t0) / 60:.0f} min in: "
+                    + (line[len("[vast] "):] if known else f"instance {iid}: Vast state unknown")
+                    + (f"; {stream.note}" if stream.note and not stream.lines else ""))
+                last_said = now
+            if now - t0 >= timeout:
+                result, verdict = "timeout", (
+                    f"no ORCH_READY or ORCH_FATAL from instance {iid} within {timeout:.0f}s "
+                    f"({last_line or 'Vast state unknown'}); the full boot log is /workspace/orch/model.log on it")
+                break
+            time.sleep(poll)
+    finally:
+        stream.finish()
+    if verdict:
+        say(verdict)
+    return result, {"lines": list(stream.lines), "fatal_line": stream.fatal_line, "instance": inst}
+
+
+def save_boot_record(iid, result, boot):
+    """Keep what a boot left behind (its log and Vast's last word on the
+    instance) next to state.json, before anything destroys the instance."""
+    d = os.path.join(os.path.dirname(os.path.abspath(STATE_PATH)), "boots")
+    try:
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{iid}.log")
+        with open(path, "w") as f:
+            f.write(f"# instance {iid}: {result} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("# last instance row from Vast: " + json.dumps(boot.get("instance"), default=str) + "\n")
+            f.write("\n".join(boot.get("lines") or []) + "\n")
+        say(f"boot log saved to {path}")
+        return path
+    except OSError as e:
+        say(f"warn: could not save the boot log for instance {iid} ({e})")
+        return None
 
 
 def cmd_logs(cfg, args):
@@ -949,8 +1133,13 @@ def cmd_logs(cfg, args):
         # The worker gives up at its own boot and download limits; allow for
         # the image pull before boot.sh starts on top of that.
         timeout = args.timeout or boot_limit_s(cfg) + 900
-        r = follow_instance_logs(v, args.instance_id, timeout, once=args.once)
-        if r in ("fatal", "gone", "timeout"):
+        rec = load_state().get("manual_instances", {}).get(str(args.instance_id), {})
+        r, boot = follow_instance_logs(v, args.instance_id, timeout, once=args.once,
+                                       stuck_s=booting_limit_s(cfg), since=rec.get("created_at"), log_v=vast())
+        if r in ("vast_error", "stuck"):
+            say(f"destroy it with `deploy.py sweep --destroy {args.instance_id}`, or let `watch` do it")
+        if r in ("fatal", "gone", "vast_error", "stuck", "timeout"):
+            save_boot_record(args.instance_id, r, boot)
             sys.exit(1)
         return
     ep = find_endpoint(v, cfg["endpoint"]["name"], load_state(), allow_state_id=True)
@@ -1051,43 +1240,96 @@ def cmd_destroy(cfg, args):
                 "were left alone; see `deploy.py status`")
 
 
+# A boot that ends in one of these failed because of the host it landed on,
+# so renting another host is the fix: Vast never started the container, or
+# the worker found the host's download speed couldn't meet the budget.
+def host_failed(result, boot):
+    return result in ("stuck", "vast_error") or (
+        result == "fatal" and "too slow on this host" in boot.get("fatal_line", ""))
+
+
+def _host_key(row):
+    """What identifies the physical machine behind an offer or instance."""
+    for k in ("machine_id", "host_id"):
+        if row.get(k) is not None:
+            return f"{k}={row[k]}"
+    return f"offer={row.get('id')}"
+
+
 def cmd_rent_test(cfg, args):
     """Rent one instance outside serverless (no PyWorker) to prove a config,
-    recording the id Vast returns so status, sweep, watch and destroy know it."""
+    recording the id Vast returns so status, sweep, watch and destroy know it.
+    Then follow its boot; if it fails because of its host (see host_failed),
+    save its log, destroy it, and rent the next cheapest other host, up to
+    limits.rent_attempts rentals in all."""
     v = vast()
     say("preflight")
     pins = check(cfg, v)
     ttl = int(cfg["limits"].get("manual_ttl_s", 14400))
+    attempts = max(1, int(cfg["limits"].get("rent_attempts", 3)))
+    follow = not getattr(args, "no_follow", False)
     opts = docker_options(cfg, pins) + f" -e ORCH_SKIP_PYWORKER=1 -e ORCH_MANUAL_TTL={ttl}"
     t, w = cfg["template"], cfg["workergroup"]
-    offers = _rows(v.search_offers(query=w["search_params"] + " rented=False", order="dph_total",
-                                   limit=1, storage=t["disk_gb"]), "search_offers")
-    if not offers:
-        raise CheckFailed("no offer matches workergroup.search_params right now")
-    o = offers[0]
-    say(f"cheapest match: offer {o.get('id')} {o.get('gpu_name', '?')} ${o.get('dph_total', 0):.3f}/hr")
-    if args.dry_run:
-        say("docker options:\n  " + opts + "\ndry run: nothing rented")
-        return
-    if not confirm(f"rent it? It stops itself after {ttl}s; `deploy.py destroy` or `sweep` removes it.", args.yes):
-        return
     label = f"orch-test:{cfg['endpoint']['name']}"
-    with StateLock():
-        st = load_state()
-        res = v.create_instance(o["id"], image=cfg["llama"]["image"], disk=float(t["disk_gb"]), env=opts,
-                                onstart_cmd=onstart_script(), label=label, ssh=True, direct=True,
-                                cancel_unavail=True)
-        iid = res.get("new_contract") if isinstance(res, dict) else None
-        if not isinstance(iid, int):
-            raise ApiError(f"create_instance returned no instance id: {str(res)[:300]}. Check the dashboard "
-                           f"for an instance labelled {label!r} and destroy it if present")
-        st.setdefault("manual_instances", {})[str(iid)] = {"created_at": time.time(), "label": label}
-        save_state(st)
-        say(f"instance {iid} rented and recorded")
-        inst = _wait_for(lambda: next((i for i in _rows(v.show_instances(), "show_instances")
-                                       if i.get("id") == iid), None), f"instance {iid}")
-        say(f"  {_describe(inst)}")
-    say(f"follow the boot with: deploy.py logs {iid}")
+    bad_hosts = []
+    for attempt in range(1, attempts + 1):
+        offers = [o for o in _rows(v.search_offers(query=w["search_params"] + " rented=False",
+                                                   order="dph_total", limit=10, storage=t["disk_gb"]),
+                                   "search_offers") if _host_key(o) not in bad_hosts]
+        if not offers:
+            raise CheckFailed("no offer matches workergroup.search_params right now"
+                              + (f" apart from hosts that failed: {', '.join(bad_hosts)}" if bad_hosts else ""))
+        o = min(offers, key=lambda o: float(o.get("dph_total") or 0))
+        say(f"cheapest match: offer {o.get('id')} {o.get('gpu_name', '?')} ${float(o.get('dph_total') or 0):.3f}/hr"
+            + (f" (rental {attempt} of up to {attempts})" if attempt > 1 else ""))
+        if args.dry_run:
+            say("docker options:\n  " + opts + "\ndry run: nothing rented")
+            return
+        if attempt == 1:
+            again = (f" If a host fails to boot it is destroyed and another rented, up to {attempts} in all."
+                     if follow and attempts > 1 else "")
+            if not confirm(f"rent it? It stops itself after {ttl}s; `deploy.py destroy` or `sweep` removes it."
+                           + again, args.yes):
+                return
+        with StateLock():
+            st = load_state()
+            res = v.create_instance(o["id"], image=cfg["llama"]["image"], disk=float(t["disk_gb"]), env=opts,
+                                    onstart_cmd=onstart_script(), label=label, ssh=True, direct=True,
+                                    cancel_unavail=True)
+            iid = res.get("new_contract") if isinstance(res, dict) else None
+            if not isinstance(iid, int):
+                raise ApiError(f"create_instance returned no instance id: {str(res)[:300]}. Check the dashboard "
+                               f"for an instance labelled {label!r} and destroy it if present")
+            created = time.time()
+            st.setdefault("manual_instances", {})[str(iid)] = {"created_at": created, "label": label}
+            save_state(st)
+            say(f"instance {iid} rented and recorded")
+            inst = _wait_for(lambda: next((i for i in _rows(v.show_instances(), "show_instances")
+                                           if i.get("id") == iid), None), f"instance {iid}")
+            say(f"  {_describe(inst)}")
+        if not follow:
+            say(f"follow the boot with: deploy.py logs {iid}")
+            return
+        result, boot = follow_instance_logs(v, iid, boot_limit_s(cfg) + 900, stuck_s=booting_limit_s(cfg),
+                                            since=created, log_v=vast())
+        if result == "ready":
+            say(f"instance {iid} is ready; it stops itself after {ttl}s, or remove it with `deploy.py destroy`")
+            return
+        save_boot_record(iid, result, boot)
+        if not host_failed(result, boot):
+            # Not the host's fault (or not known to be): leave it for a look;
+            # it stops itself, and watch/sweep clean up after manual_ttl_s.
+            raise CheckFailed(f"instance {iid} did not boot ({result}); see the log above. It was left as is: "
+                              f"`deploy.py sweep --destroy {iid}` removes it")
+        bad_hosts.append(_host_key(o))
+        say(f"instance {iid} failed because of its host ({result}); destroying it")
+        with StateLock():
+            destroy_and_wait(v, [iid])
+            st = load_state()
+            st.get("manual_instances", {}).pop(str(iid), None)
+            save_state(st)
+    raise CheckFailed(f"{attempts} rentals failed to boot on their hosts ({', '.join(bad_hosts)}); "
+                      "nothing is left running. See the saved boot logs")
 
 
 # ── watch ────────────────────────────────────────────────────────────────────
@@ -1111,7 +1353,7 @@ def watch_tick(v, cfg, st, now=None):
     for w in stuck:
         actions.append(f"destroy stuck worker {w.get('id')} ({w.get('status')} for >{limit}s)")
     for i in r["orphans"]:
-        actions.append(f"destroy orphan {_describe(i)}")
+        actions.append(f"destroy orphan {_describe(i, r['why'].get(i.get('id'), ''))}")
     if targets:
         destroy_and_wait(v, targets)
         for i in targets:
@@ -1173,6 +1415,8 @@ def main():
     p.add_argument("--interval", type=float, default=60, help="watch: seconds between checks")
     p.add_argument("--once", action="store_true",
                    help="watch: one check, then exit; logs ID: print the log once, don't wait")
+    p.add_argument("--no-follow", action="store_true",
+                   help="rent-test: rent and record the instance, then exit without following its boot")
     p.add_argument("--timeout", type=float, default=0,
                    help="logs ID: seconds to wait for a marker (default: boot.deadline_s + download_max_s + 900)")
     args = p.parse_args()

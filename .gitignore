@@ -6,3 +6,4 @@ deploy/state.json
 shim/.env
 deploy/state.json.lock
 deploy/state.json.tmp
+deploy/boots/

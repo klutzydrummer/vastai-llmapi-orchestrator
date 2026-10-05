@@ -53,6 +53,9 @@ class FakeVast:
         self.ignore = set()        # endpoint fields the "server" silently ignores
         self.next_id = 100
         self.client = types.SimpleNamespace(post=self._post)
+        self.offers = [{"id": 777, "machine_id": 1, "gpu_name": "RTX 4090", "dph_total": 0.31}]
+        self.boot_plan = []        # per rental: (actual_status, status_msg, log text or exception)
+        self.boot_logs = {}
 
     def _id(self):
         self.next_id += 1
@@ -132,13 +135,25 @@ class FakeVast:
             self.instances = [i for i in self.instances if i["id"] != id]
 
     def search_offers(self, **kw):
-        return [{"id": 777, "gpu_name": "RTX 4090", "dph_total": 0.31}]
+        return copy.deepcopy(self.offers[:kw.get("limit", 10)])
 
     def create_instance(self, offer, **kw):
         self.calls.append(("create_instance", offer, kw))
         iid = self._id()
-        self.instances.append(inst(iid, label=kw.get("label")))
+        row = inst(iid, label=kw.get("label"))
+        if self.boot_plan:
+            row["actual_status"], row["status_msg"], self.boot_logs[iid] = self.boot_plan.pop(0)
+        self.instances.append(row)
         return {"success": True, "new_contract": iid}
+
+    def show_instance(self, id):
+        return next((copy.deepcopy(i) for i in self.instances if i["id"] == id), None)
+
+    def logs(self, id, tail=None):
+        out = self.boot_logs.get(id, RuntimeError("Result not ready"))
+        if isinstance(out, Exception):
+            raise out
+        return out
 
     def made(self, name):
         return [c for c in self.calls if c[0] == name]
@@ -505,7 +520,7 @@ def rent_test_records_the_id_vast_returns():
     real_check = deploy.check
     deploy.check = lambda cfg, v=None: PINS
     try:
-        deploy.cmd_rent_test(BASE_CFG, args())
+        deploy.cmd_rent_test(BASE_CFG, args(no_follow=True))
     finally:
         deploy.check = real_check
     (_, offer, kw), = v.made("create_instance")
@@ -517,6 +532,70 @@ def rent_test_records_the_id_vast_returns():
     assert [i["id"] for i in r["manual"]] == [iid]
     r = deploy.survey(v, BASE_CFG, st, None, 900, now=time.time() + 14401)
     assert [i["id"] for i in r["orphans"]] == [iid]
+
+
+def rent_with_boots(*boots, offers=None):
+    v = FakeVast()
+    if offers:
+        v.offers = offers
+    v.boot_plan = list(boots)
+    deploy.vast = lambda: v
+    real = deploy.check, deploy.VAST_ERROR_CONFIRM_S, deploy.LOGS_POLL_S, deploy.say
+    deploy.check = lambda cfg, v=None: PINS
+    deploy.VAST_ERROR_CONFIRM_S, deploy.LOGS_POLL_S = 0, 0
+    out = []
+    deploy.say = out.append
+    try:
+        try:
+            deploy.cmd_rent_test(BASE_CFG, args())
+            err = None
+        except deploy.CheckFailed as e:
+            err = str(e)
+    finally:
+        deploy.check, deploy.VAST_ERROR_CONFIRM_S, deploy.LOGS_POLL_S, deploy.say = real
+    return v, out, err
+
+
+THREE_HOSTS = [{"id": 777, "machine_id": 1, "gpu_name": "RTX 3090", "dph_total": 0.16},
+               {"id": 778, "machine_id": 2, "gpu_name": "RTX 3090", "dph_total": 0.17},
+               {"id": 779, "machine_id": 3, "gpu_name": "RTX 3090", "dph_total": 0.18}]
+
+
+@case
+def rent_test_replaces_a_host_that_fails_to_boot():
+    """rent-test: a host where Vast says 'Secrets fetch failed' has its log saved and is destroyed; the next cheapest other host is rented and boots"""
+    v, out, err = rent_with_boots(("loading", "Secrets fetch failed: network/subprocess error", RuntimeError("x")),
+                                  ("running", "", "ssh setup\n[t] [boot] ORCH_READY model=x"), offers=THREE_HOSTS)
+    assert err is None, (err, out)
+    assert [c[1] for c in v.made("create_instance")] == [777, 778], v.calls
+    assert [c[1] for c in v.made("destroy_instance")] == [101], v.calls
+    assert [i["id"] for i in v.instances] == [102], v.instances
+    assert set(deploy.load_state()["manual_instances"]) == {"102"}
+    saved = os.path.join(os.path.dirname(deploy.STATE_PATH), "boots", "101.log")
+    assert "Secrets fetch failed" in open(saved).read(), out
+    assert any("is ready" in o for o in out), out
+
+
+@case
+def rent_test_keeps_a_boot_that_failed_for_another_reason():
+    """rent-test: an ORCH_FATAL that isn't about the host is reported and the instance kept for a look, not replaced"""
+    v, out, err = rent_with_boots(("running", "", "[t] [boot] ORCH_FATAL: smoke test failed"), offers=THREE_HOSTS)
+    assert err and "did not boot (fatal)" in err, (err, out)
+    assert len(v.made("create_instance")) == 1 and not v.made("destroy_instance"), v.calls
+    # a host too slow for the download budget is the host's fault: replaced
+    v, out, err = rent_with_boots(
+        ("running", "", "[t] [boot] ORCH_FATAL: weights download too slow on this host (see the [fetch] line above)"),
+        ("running", "", "[t] [boot] ORCH_READY model=x"), offers=THREE_HOSTS)
+    assert err is None and [c[1] for c in v.made("create_instance")] == [777, 778], (err, v.calls)
+
+
+@case
+def rent_test_stops_after_rent_attempts():
+    """rent-test: after limits.rent_attempts hosts fail it stops with nothing left running"""
+    bad = ("loading", "Secrets fetch failed", RuntimeError("x"))
+    v, out, err = rent_with_boots(bad, bad, bad, bad, offers=THREE_HOSTS + [dict(THREE_HOSTS[0], id=780, machine_id=4)])
+    assert err and "3 rentals failed" in err and "nothing is left running" in err, (err, out)
+    assert len(v.made("create_instance")) == 3 and not v.instances, v.calls
 
 
 # ── watch ────────────────────────────────────────────────────────────────────
@@ -693,9 +772,11 @@ def download_limits_reach_the_worker():
 
 
 class LogVast:
-    """vastai logs returns the whole (tail of the) container log each call."""
+    """vastai logs returns the whole (tail of the) container log each call.
+    status may be a list of (actual_status, status_msg), one per show_instance
+    call, the last repeating."""
     def __init__(self, logs, status="running"):
-        self.logs_seq, self.status, self.calls = list(logs), status, 0
+        self.logs_seq, self.status, self.calls, self.shows = list(logs), status, 0, 0
 
     def logs(self, instance_id, tail=None):
         self.calls += 1
@@ -705,14 +786,27 @@ class LogVast:
         return out
 
     def show_instance(self, id):
+        if isinstance(self.status, list):
+            self.shows += 1
+            status, msg = self.status[min(self.shows, len(self.status)) - 1]
+            return {"id": id, "actual_status": status, "status_msg": msg}
         return {"id": id, "actual_status": self.status} if self.status else None
+
+
+def ticking(step):
+    """A clock that moves on `step` seconds each time it is read."""
+    t = [1_000_000.0]
+    def clock():
+        t[0] += step
+        return t[0]
+    return clock
 
 
 def follow(v, **kw):
     out, real = [], deploy.say
     deploy.say = out.append
     try:
-        return deploy.follow_instance_logs(v, 5, kw.pop("timeout", 60), poll=0, **kw), out
+        return deploy.follow_instance_logs(v, 5, kw.pop("timeout", 60), poll=0, **kw)[0], out
     finally:
         deploy.say = real
 
@@ -764,6 +858,9 @@ def logs_follows_an_instance_until_ready():
     assert r == "ready", (r, out)
     assert out.count("[00:01:00] [boot] boot start") == 1 and out[-1].endswith("ORCH_READY model=waifugemma4"), out
     assert any("no log from Vast yet" in o for o in out), out
+    # the log streams from the start, whatever Vast says about the instance
+    v = LogVast(["ssh setup\n[t] [boot] ORCH_READY model=x"], status=[("loading", "")])
+    assert follow(v, timeout=10 ** 6)[0] == "ready"
 
 
 @case
@@ -776,9 +873,77 @@ def logs_reports_fatal_gone_and_timeout():
     r, out = follow(LogVast(["ssh setup"]), timeout=0)
     assert r == "timeout" and "model.log" in out[-1], out
     r, out = follow(LogVast(["ssh setup", "never read"]), once=True)
-    assert r == "once" and out == ["ssh setup"], out
+    assert r == "once" and out == ["ssh setup", "[vast] instance 5: running"], out
     # the env var naming the marker is not the marker
     assert follow(LogVast(["ORCH_FATAL_GRACE=600"]), timeout=0)[0] == "timeout"
+
+
+SECRETS = "Secrets fetch failed: network/subprocess error"
+
+
+@case
+def logs_stops_on_an_error_vast_reports():
+    """rental 54214819: Vast says 'Secrets fetch failed' while loading; logs ID prints it and exits within a few minutes"""
+    v = LogVast([RuntimeError("Result not ready")], status=[("loading", SECRETS)])
+    r, out = follow(v, clock=ticking(20), timeout=10 ** 6)
+    assert r == "vast_error", (r, out)
+    assert any(o.startswith("[vast] instance 5: loading") and SECRETS in o for o in out), out
+    assert "still bills" in out[-1], out
+    # the log was being fetched all along, though Vast never started a container
+    assert v.calls >= 1, v.calls
+    # a message that clears once the container starts isn't an error
+    v = LogVast(["ssh setup", "ssh setup", "ssh setup\n[t] [boot] ORCH_READY model=x"],
+                status=[("loading", "Error response from daemon: retrying"), ("running", "")])
+    assert follow(v, clock=ticking(20), timeout=10 ** 6)[0] == "ready"
+
+
+@case
+def logs_stops_on_an_instance_stuck_booting():
+    """an instance Vast keeps reporting as loading, with no error, counts as stuck after stuck_grace_s from its rental"""
+    v = LogVast([RuntimeError("Result not ready")], status=[("loading", "Pulling image layer 3/9")])
+    r, out = follow(v, clock=ticking(20), timeout=10 ** 6, stuck_s=600)
+    assert r == "stuck" and "stuck_grace_s=600" in out[-1], (r, out)
+    # issue 13: a status line about once a minute while waiting, with context
+    waits = [o for o in out if o.startswith("still waiting")]
+    assert len(waits) >= 5 and "loading" in waits[-1] and "Pulling image" in waits[-1] \
+        and "no log from Vast yet" in waits[-1], out
+    # rented 590 s before logs started: stuck almost at once
+    clock = ticking(20)
+    rented = clock() - 590
+    r, out = follow(LogVast([RuntimeError("x")], status=[("loading", "")]), clock=clock, timeout=10 ** 6,
+                    stuck_s=600, since=rented)
+    assert r == "stuck" and len([o for o in out if o.startswith("still waiting")]) == 0, (r, out)
+    # once the container runs, the download and model load have their own limits
+    r, out = follow(LogVast(["ssh setup"], status=[("running", "")]), clock=ticking(20), timeout=3000,
+                    stuck_s=600)
+    assert r == "timeout", (r, out)
+
+
+@case
+def describe_and_vast_error_read_the_status_message():
+    """status lists carry Vast's status message; only a booting instance's error message counts as an error"""
+    i = dict(inst(1, status="loading"), status_msg=SECRETS)
+    assert SECRETS in deploy._describe(i) and deploy.vast_error(i) == SECRETS
+    assert deploy.vast_error(dict(i, actual_status="running")) == ""
+    assert deploy.vast_error(dict(i, status_msg="Pulling image")) == ""
+
+
+@case
+def watch_destroys_test_rental_stuck_loading():
+    """watch destroys a rent-test instance Vast still reports loading after stuck_grace_s; running or younger ones stay"""
+    v = FakeVast()
+    t0 = time.time()
+    v.instances = [dict(inst(1, status="loading"), status_msg=SECRETS), inst(2, status="loading"),
+                   inst(3, status="running")]
+    st = deploy.load_state()
+    grace = BASE_CFG["limits"]["stuck_grace_s"]
+    st["manual_instances"] = {"1": {"created_at": t0 - grace - 1}, "2": {"created_at": t0 - grace + 60},
+                              "3": {"created_at": t0 - grace - 1}}
+    deploy.save_state(st)
+    acts = tick(v, t0)
+    assert [c[1] for c in v.made("destroy_instance")] == [1], (acts, v.calls)
+    assert "still loading" in acts[0] and SECRETS in acts[0], acts
+    assert set(deploy.load_state()["manual_instances"]) == {"2", "3"}
 
 
 @case

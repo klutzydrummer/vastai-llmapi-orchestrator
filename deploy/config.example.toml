@@ -70,7 +70,9 @@ max_hourly_usd  = 1.20
 max_workers_cap = 2          # endpoint.max_workers may not exceed this
 on_breach       = "pause"    # watch: pause the endpoint when the account's running $/hr exceeds max_hourly_usd ("alert" = log only)
 manual_ttl_s    = 14400      # rent-test instances stop themselves after this; sweep/watch then destroy them
-stuck_grace_s   = 600        # watch: destroy a worker Vast still reports booting boot.deadline_s + this after first seen
+stuck_grace_s   = 600        # watch: destroy a worker Vast still reports booting boot.deadline_s + download_max_s + this
+                             # after first seen, and a rent-test instance Vast reports booting (no container) this long
+rent_attempts   = 3          # rent-test: when a host fails to boot (stuck, Vast error, too slow), destroy it and rent another, up to this many
 orphan_min_age_s = 900       # watch: a former worker must be off the worker list this long before it is destroyed
 
 [template]
