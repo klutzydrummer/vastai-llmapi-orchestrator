@@ -24,9 +24,9 @@ FATAL_MARK="ORCH_FATAL"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/app/llama-server}"
 LLAMA_HOST="127.0.0.1"
 LLAMA_PORT="18000"   # pyworker's workers/openai/core.py hardcodes this port
-# With an embedding model (EMBED_FILE), two llama-servers run behind
-# worker/router.py, which takes LLAMA_PORT: chat on CHAT_PORT, embeddings on
-# EMBED_PORT. Without one, the chat llama-server listens on LLAMA_PORT itself.
+# worker/router.py takes LLAMA_PORT, in front of the chat llama-server on
+# CHAT_PORT and, with an embedding model (EMBED_FILE), the embedding one on
+# EMBED_PORT. It also answers /orch/info for the shim's status page.
 CHAT_PORT="18010"
 EMBED_PORT="18011"
 EMBED_SERVED_NAME="${EMBED_SERVED_NAME:-}"
@@ -337,6 +337,30 @@ if ! grep -qi "cuda" <<<"$devices"; then
 fi
 log "llama.cpp sees: $(grep -i cuda <<<"$devices" | head -3 | paste -sd ';')"
 
+# ── will it fit? ──────────────────────────────────────────────────────────────
+# worker/vram.py reads the model headers (from the Hub, a few MB each, before
+# anything is downloaded) and works out whether chat model + projector +
+# embedding model fit in the GPU memory that is free, giving up embedding
+# context, then embedding cache precision, then chat context (down to
+# LLAMA_CTX_MIN) if they don't. A set that can't fit fails here, before the
+# download, saying by how much. If the Hub headers can't be read, the same
+# check runs on the downloaded files instead.
+PLAN_ENV="$ORCH_DIR/plan.env"
+# vram_plan STAGE: runs the planner, its lines to the log; returns its exit status.
+vram_plan(){
+    rm -f "$PLAN_ENV"
+    python3 "$ORCH_DIR/vram.py" plan --stage "$1" --env "$PLAN_ENV" --json "$ORCH_DIR/plan-$1.json" 2>&1 \
+        | while IFS= read -r line; do echo "$line" | tee -a "$MODEL_LOG"; console "$line"; done
+    return "${PIPESTATUS[0]}"
+}
+phase "checking that the models fit in GPU memory"
+vram_plan pre; rc=$?
+case "$rc" in
+    0) ;;
+    7) fatal "models don't fit in this GPU's free memory (see the [vram] lines above)" ;;
+    *) log "warn: couldn't size GPU memory from the Hub headers (exit $rc); checking the downloaded files instead" ;;
+esac
+
 # ── weights ───────────────────────────────────────────────────────────────────
 export PATHS_ENV="$ORCH_DIR/paths.env"
 rm -f "$PATHS_ENV"
@@ -348,16 +372,108 @@ rc=${PIPESTATUS[0]}
 # shellcheck disable=SC1090
 . "$PATHS_ENV"
 [ -s "${MODEL_PATH:-}" ] || fatal "fetch reported success but MODEL_PATH is missing"
-export MODEL_PATH MMPROJ_PATH="${MMPROJ_PATH:-}"
+export MODEL_PATH MMPROJ_PATH="${MMPROJ_PATH:-}" EMBED_PATH="${EMBED_PATH:-}"
 
 # ── llama-server ──────────────────────────────────────────────────────────────
 help=$(with_timeout 120 "$LLAMA_SERVER_BIN" --help 2>&1)
 has(){ grep -q -- "$1" <<<"$help"; }
 
-chat_port="$LLAMA_PORT"
-[ -n "${EMBED_PATH:-}" ] && chat_port="$CHAT_PORT"
+# Sizes from the downloaded files (sha-verified, so an unreadable header is a
+# real problem, not a network one).
+phase "checking that the models fit in GPU memory"
+vram_plan local; rc=$?
+[ "$rc" -ne 7 ] || fatal "models don't fit in this GPU's free memory (see the [vram] lines above)"
+[ "$rc" -eq 0 ] || fatal "couldn't size GPU memory from the model files (vram.py exit $rc, see above)"
+# shellcheck disable=SC1090
+. "$PLAN_ENV"
+
+# serve_log NAME: one llama-server's output, line by line, to its own log
+# ($ORCH_DIR/NAME.log), MODEL_LOG and the container console, prefixed with
+# NAME, so its errors show in `vastai logs`. Once the worker is ready only
+# warnings and errors go to the console (request logs would flood it).
+QUIET_MARK="$ORCH_DIR/.serving"
+rm -f "$QUIET_MARK"
+serve_log(){
+    local name="$1" line
+    : > "$ORCH_DIR/$name.log"
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$ORCH_DIR/$name.log"
+        printf '[%s] %s\n' "$name" "$line" >> "$MODEL_LOG"
+        if [ ! -e "$QUIET_MARK" ] || [[ "$line" =~ [Ee]rror|ERROR|[Ww]arn|WARN|[Ff]ail|out\ of\ memory ]]; then
+            console "[$name] $line"
+        fi
+    done
+}
+# load_error NAME: the line that best says why a server failed to load.
+load_error(){
+    local f="$ORCH_DIR/$1.log" l
+    sleep 1   # let serve_log write the server's last lines
+    l=$(grep -m1 -iE 'out of memory|cudaMalloc failed|failed to allocate' "$f" 2>/dev/null)
+    [ -n "$l" ] || l=$(grep -iE 'error|failed' "$f" 2>/dev/null | tail -n 1)
+    [ -n "$l" ] || l=$(tail -n 1 "$f" 2>/dev/null)
+    printf '%s' "${l:0:300}"
+}
+gpu_used(){ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
+# wait_healthy URL WHAT PID: until URL answers 200, with a heartbeat; fatal if
+# PID exits, the load takes too long or the boot deadline passes.
+wait_healthy(){
+    local url="$1" what="$2" pid="$3" name="$4" t0=$SECONDS next_beat=$LOAD_HEARTBEAT_S
+    until curl -sf "$url" >/dev/null 2>&1; do
+        kill -0 "$pid" 2>/dev/null || fatal "$what exited during load: $(load_error "$name")"
+        [ -z "$ROUTER_PID" ] || kill -0 "$ROUTER_PID" 2>/dev/null || fatal "router exited during load (see log above)"
+        [ $((SECONDS - t0)) -lt "$LOAD_TIMEOUT" ] || fatal "$what not healthy after ${LOAD_TIMEOUT}s"
+        [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] && fatal "boot deadline hit during load"
+        if [ $((SECONDS - t0)) -ge "$next_beat" ]; then
+            log "still loading $what after $((SECONDS - t0))s; it says: $(tail -n 1 "$ORCH_DIR/$name.log" 2>/dev/null | cut -c1-200)"
+            next_beat=$((next_beat + LOAD_HEARTBEAT_S))
+        fi
+        sleep 1
+    done
+    log "$what healthy after $((SECONDS - t0))s"
+}
+
+phase "loading the model"
+# The embedding server starts first and alone: the chat server is then sized
+# from the memory that is actually left, not from an estimate of what the
+# embedding server will take.
+if [ -n "${EMBED_PATH:-}" ]; then
+    # Each input must fit in one batch, so batch = context; one slot gets all
+    # of it (inputs in a request are processed one after another).
+    ectx="${PLAN_EMBED_CTX:-0}"
+    eargs=(-m "$EMBED_PATH" --host "$LLAMA_HOST" --port "$EMBED_PORT"
+           -a "${EMBED_SERVED_NAME:-embedding}" --embedding --pooling "$EMBED_POOLING" -np 1)
+    case "$(tr '[:upper:]' '[:lower:]' <<<"${EMBED_GPU:-1}")" in
+        0|false|no|off)
+            ectx="$EMBED_CTX"
+            eargs+=(-c "$ectx" -b "$ectx" -ub "$ectx" -ngl 0)
+            log "embedding model on the CPU ([embedding] gpu = false)" ;;
+        *)
+            [ "$ectx" -gt 0 ] 2>/dev/null || fatal "the GPU memory plan has no embedding context (see the [vram] lines above)"
+            eargs+=(-c "$ectx" -b "$ectx" -ub "$ectx" -ngl 999)
+            [ -n "${PLAN_EMBED_CACHE:-}" ] && eargs+=(-ctk "$PLAN_EMBED_CACHE" -ctv "$PLAN_EMBED_CACHE") ;;
+    esac
+    # Flash attention keeps the attention buffer small at a large batch size.
+    has "--flash-attn" && eargs+=(-fa on)
+    has "--no-webui"   && eargs+=(--no-webui)
+    log "launching embedding llama-server: ${eargs[*]}"
+    used0=$(gpu_used)
+    "$LLAMA_SERVER_BIN" "${eargs[@]}" > >(serve_log embed) 2>&1 &
+    EMBED_PID=$!
+    wait_healthy "http://$LLAMA_HOST:$EMBED_PORT/health" "embedding llama-server" "$EMBED_PID" embed
+    log "VRAM after embedding: $(gpu_used) MiB used (was $used0 MiB before it started; estimated ${PLAN_EMBED_EST_MIB:-?} MiB)"
+    vram_plan chat; rc=$?
+    [ "$rc" -ne 7 ] || fatal "chat model doesn't fit in the GPU memory left after the embedding server (see the [vram] lines above)"
+    [ "$rc" -eq 0 ] || fatal "couldn't size GPU memory for the chat model (vram.py exit $rc, see above)"
+    # shellcheck disable=SC1090
+    . "$PLAN_ENV"
+fi
+
+chat_port="$CHAT_PORT"
+# -ngl 999 keeps every layer on the GPU (and turns llama.cpp's own --fit off):
+# the plan above already chose settings that fit.
 args=(-m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$chat_port"
-      -a "$SERVED_MODEL_NAME" -c "$LLAMA_CTX" -np "$LLAMA_PARALLEL" -ngl 999
+      -a "$SERVED_MODEL_NAME" -c "${PLAN_CTX:-$LLAMA_CTX}" -np "$LLAMA_PARALLEL" -ngl 999
+      -b "${PLAN_BATCH:-2048}" -ub "${PLAN_UBATCH:-512}"
       -ctk "$LLAMA_CACHE_TYPE" -ctv "$LLAMA_CACHE_TYPE")
 [ -n "$MMPROJ_PATH" ] && args+=(--mmproj "$MMPROJ_PATH")
 has "--kv-unified"       && args+=(--kv-unified)
@@ -372,44 +488,27 @@ if [ -n "$LLAMA_EXTRA_ARGS" ]; then
     args+=("${extra[@]}")
 fi
 
-phase "loading the model"
 log "launching llama-server: ${args[*]}"
-"$LLAMA_SERVER_BIN" "${args[@]}" >> "$MODEL_LOG" 2>&1 &
+used0=$(gpu_used)
+"$LLAMA_SERVER_BIN" "${args[@]}" > >(serve_log chat) 2>&1 &
 LLAMA_PID=$!
+wait_healthy "http://$LLAMA_HOST:$chat_port/health" "llama-server" "$LLAMA_PID" chat
 
-if [ -n "${EMBED_PATH:-}" ]; then
-    # Each input must fit in one batch, so batch = context; one slot gets all
-    # of it (inputs in a request are processed one after another).
-    eargs=(-m "$EMBED_PATH" --host "$LLAMA_HOST" --port "$EMBED_PORT"
-           -a "${EMBED_SERVED_NAME:-embedding}" --embedding --pooling "$EMBED_POOLING"
-           -c "$EMBED_CTX" -b "$EMBED_CTX" -ub "$EMBED_CTX" -np 1 -ngl 999)
-    # Flash attention keeps the attention buffer small at a large batch size.
-    has "--flash-attn" && eargs+=(-fa on)
-    has "--no-webui"   && eargs+=(--no-webui)
-    log "launching embedding llama-server: ${eargs[*]}"
-    "$LLAMA_SERVER_BIN" "${eargs[@]}" >> "$MODEL_LOG" 2>&1 &
-    EMBED_PID=$!
-    ROUTER_PORT="$LLAMA_PORT" CHAT_URL="http://$LLAMA_HOST:$CHAT_PORT" \
-        EMBED_URL="http://$LLAMA_HOST:$EMBED_PORT" \
-        python3 "$ORCH_DIR/router.py" >> "$MODEL_LOG" 2>&1 &
-    ROUTER_PID=$!
-fi
+embed_url=""
+[ -n "${EMBED_PATH:-}" ] && embed_url="http://$LLAMA_HOST:$EMBED_PORT"
+ROUTER_PORT="$LLAMA_PORT" CHAT_URL="http://$LLAMA_HOST:$CHAT_PORT" EMBED_URL="$embed_url" ORCH_DIR="$ORCH_DIR" \
+    python3 "$ORCH_DIR/router.py" > >(serve_log router) 2>&1 &
+ROUTER_PID=$!
+wait_healthy "http://$LLAMA_HOST:$LLAMA_PORT/health" "router" "$ROUTER_PID" router
 
-# With the router up, its /health is 200 only once both servers are healthy.
-t0=$SECONDS; next_beat=$LOAD_HEARTBEAT_S
-until curl -sf "http://$LLAMA_HOST:$LLAMA_PORT/health" >/dev/null 2>&1; do
-    kill -0 "$LLAMA_PID" 2>/dev/null || fatal "llama-server exited during load (see log above)"
-    [ -z "$EMBED_PID" ] || kill -0 "$EMBED_PID" 2>/dev/null || fatal "embedding llama-server exited during load (see log above)"
-    [ -z "$ROUTER_PID" ] || kill -0 "$ROUTER_PID" 2>/dev/null || fatal "router exited during load (see log above)"
-    [ $((SECONDS - t0)) -lt "$LOAD_TIMEOUT" ] || fatal "llama-server not healthy after ${LOAD_TIMEOUT}s"
-    [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] && fatal "boot deadline hit during load"
-    if [ $((SECONDS - t0)) -ge "$next_beat" ]; then
-        log "still loading after $((SECONDS - t0))s; server says: $(grep -v '\] \[boot\] ' "$MODEL_LOG" | tail -n 1 | cut -c1-200)"
-        next_beat=$((next_beat + LOAD_HEARTBEAT_S))
-    fi
-    sleep 3
+# What llama.cpp actually allocated, next to the plan, so every boot shows
+# how close the estimate was.
+for n in embed chat; do
+    [ -s "$ORCH_DIR/$n.log" ] || continue
+    grep -E 'KV buffer size|compute buffer size|model buffer size|CLIP.*buffer size' "$ORCH_DIR/$n.log" 2>/dev/null \
+        | sed -E 's/^[[:space:]]+//' | head -n 12 | while IFS= read -r line; do log "[$n] $line"; done
 done
-log "llama-server healthy after $((SECONDS - t0))s"
+log "VRAM after chat: $(gpu_used) MiB used (was $used0 MiB before it started; estimated ${PLAN_CHAT_EST_MIB:-?} MiB, plus a ${PLAN_MARGIN_MIB:-?} MiB margin kept free)"
 
 # ── prove it works ────────────────────────────────────────────────────────────
 phase "smoke test"
@@ -421,6 +520,7 @@ LLAMA_URL="http://$LLAMA_HOST:$LLAMA_PORT" SERVED_MODEL_NAME="$SERVED_MODEL_NAME
 [ "$(cat "$STATE_FILE" 2>/dev/null)" = "fatal" ] && fatal "boot deadline hit"
 echo "ready" > "$STATE_FILE"
 echo "ready" > "$ORCH_DIR/phase"
+touch "$QUIET_MARK"
 log "$READY_MARK model=$SERVED_MODEL_NAME"
 
 # ── stay up with the servers; report the first one that dies ─────────────────

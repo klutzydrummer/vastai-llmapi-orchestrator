@@ -3,10 +3,14 @@
 
 Behaviour knobs (env):
   FAKE_LLAMA_MODE  ok (default) | crash (exit during load) | novision |
-                   textfail | die_after_ready
+                   textfail | die_after_ready | oom_mmproj (CUDA out of
+                   memory loading the projector, as on rental 54231885)
   FAKE_LLAMA_LOAD_SECS  seconds of 503 before /health turns 200 (default 2)
   FAKE_EMBED_MODE  ok (default) | zero (all-zero vectors) | crash (the
                    --embedding server exits during load)
+  FAKE_EMBED_LOAD_SECS  load time of the --embedding server (default: as above)
+  FAKE_EVENTS      file to append "start chat|embed" and "healthy chat|embed"
+                   to, so tests can check the order servers came up in
 """
 import json
 import os
@@ -52,6 +56,20 @@ has_mmproj = "--mmproj" in argv
 embedding = "--embedding" in argv
 if embedding:
     MODE = "crash" if EMBED_MODE == "crash" else "ok"
+    LOAD = float(os.environ.get("FAKE_EMBED_LOAD_SECS", LOAD))
+NAME = "embed" if embedding else "chat"
+EVENTS = os.environ.get("FAKE_EVENTS")
+told = set()
+
+
+def event(what):
+    if EVENTS and what not in told:
+        told.add(what)
+        with open(EVENTS, "a") as f:
+            f.write(f"{what} {NAME}\n")
+
+
+event("start")
 for f in (arg("-m"), arg("--mmproj")):
     if f and not os.path.exists(f):
         print(f"error loading model: {f} missing", flush=True)
@@ -75,9 +93,20 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         loaded = time.time() - t_start >= LOAD
         if self.path == "/health":
+            if loaded:
+                event("healthy")
             self._json(200 if loaded else 503, {"status": "ok" if loaded else "loading"})
         elif self.path == "/props":
-            self._json(200, {"modalities": {"vision": has_mmproj and MODE != "novision"}})
+            n_seq = int(arg("-np", "1"))
+            self._json(200, {"modalities": {"vision": has_mmproj and MODE != "novision"},
+                             "total_slots": n_seq, "model_path": arg("-m"), "build_info": "b0-fake",
+                             "default_generation_settings": {"n_ctx": int(arg("-c", "4096")) // n_seq}})
+        elif self.path == "/v1/models":
+            self._json(200, {"object": "list", "data": [{"id": arg("-a", "model"), "object": "model",
+                             "meta": {"n_ctx_train": 4096 if not embedding else 32768,
+                                      "n_embd": 256 if not embedding else 128}}]})
+        elif self.path == "/slots" and not embedding:
+            self._json(200, [{"id": i, "is_processing": False} for i in range(int(arg("-np", "1")))])
         else:
             self._json(404, {})
 
@@ -116,7 +145,25 @@ if MODE == "crash":
     time.sleep(0.5)
     print("error loading model: simulated", flush=True)
     sys.exit(1)
+if MODE == "oom_mmproj":
+    # What b11371 printed on rental 54231885, the projector loading after the chat model.
+    for line in (
+            "llama_kv_cache:      CUDA0 KV buffer size =   340.00 MiB",
+            "llama_context:      CUDA0 compute buffer size =   522.62 MiB",
+            "clip_model_loader: model name:   gemma-4-26B-A4B-it",
+            "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1139.46 MiB on device 0: "
+            "cudaMalloc failed: out of memory",
+            "alloc_tensor_range: failed to allocate CUDA0 buffer of size 1194806272",
+            "clip_init: failed to load model 'mmproj-BF16.gguf': load_tensors: failed to allocate buffer",
+            "mtmd_init_from_file: error: Failed to load CLIP model from mmproj-BF16.gguf",
+            "srv    load_model: failed to load multimodal model, 'mmproj-BF16.gguf'",
+            "main: exiting due to model loading error"):
+        print(line, flush=True)
+    time.sleep(0.3)
+    sys.exit(1)
 time.sleep(LOAD)
+print("llama_kv_cache:      CUDA0 KV buffer size =    64.00 MiB", flush=True)
+print("llama_context:      CUDA0 compute buffer size =    12.50 MiB", flush=True)
 print("main: model loaded", flush=True)
 if MODE == "die_after_ready":
     time.sleep(6)

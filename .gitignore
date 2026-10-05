@@ -7,3 +7,4 @@ shim/.env
 deploy/state.json.lock
 deploy/state.json.tmp
 deploy/boots/
+shim/.info-cache.json*

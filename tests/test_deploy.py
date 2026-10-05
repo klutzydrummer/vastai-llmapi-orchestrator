@@ -679,6 +679,86 @@ def warm_hours_settings_are_checked():
     deploy.check_limits(warm_cfg())
 
 
+# ── GPU memory preflight ─────────────────────────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "fakes"))
+import gguf  # noqa: E402
+
+GGUF_DIR = tempfile.mkdtemp(prefix="test_deploy_gguf.")
+KIND = {"chat.gguf": "gemma4", "mmproj.gguf": "gemma4-mmproj", "embed.gguf": "qwen3-embed"}
+for _name, _kind in KIND.items():
+    gguf.write(os.path.join(GGUF_DIR, _name), gguf.KINDS[_kind]())
+
+
+def local_header(repo, sha, path):
+    return deploy.vram.read_header(deploy.vram.FileSource(os.path.join(GGUF_DIR, path)))
+
+
+def gemma_cfg(**llama):
+    with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.waifugemma4.example.toml"), "rb") as f:
+        cfg = tomllib.load(f)
+    cfg["llama"].update(llama)
+    return cfg
+
+
+def gemma_files(chat_size=14_970_000_000):
+    return {"chat": ("r", "a" * 40, "chat.gguf", chat_size), "mmproj": ("r", "c" * 40, "mmproj.gguf", 1_194_800_000),
+            "embed": ("r", "d" * 40, "embed.gguf", 639_153_184)}
+
+
+@case
+def check_sizes_for_the_smallest_allowed_gpu():
+    """check: WaifuGemma4 + BF16 projector + GPU embedding fit the smallest GPU gpu_ram>=22 allows (24 GiB)"""
+    cfg = gemma_cfg()
+    assert deploy.smallest_gpu_mib(cfg) == 24576
+    p = deploy.gpu_memory_plan(cfg, gemma_files(), read_header=local_header)
+    assert p["fits"] and p["total_mib"] == 24576 and p["free_mib"] == 24576 - deploy.DRIVER_RESERVE_MIB
+    assert "embedding weights" in p["parts_mib"] and p["ubatch"] == 1120
+
+
+@case
+def check_fails_a_set_that_cannot_fit_and_lists_options():
+    """check: a Q8_0 chat model on 24 GiB fails, says by how much and lists the owner's options without picking one"""
+    try:
+        deploy.gpu_memory_plan(gemma_cfg(), gemma_files(26_900_000_000), read_header=local_header)
+        raise AssertionError("expected CheckFailed")
+    except deploy.CheckFailed as e:
+        msg = str(e)
+    assert re.search(r"[0-9]+ MiB short", msg), msg
+    for opt in ("larger GPU", "llama.ctx_min", "--no-mmproj-offload", "embedding.gpu = false"):
+        assert opt in msg, (opt, msg)
+
+
+@case
+def check_counts_settings_that_move_parts_off_the_gpu():
+    """check: --no-mmproj-offload and embedding.gpu = false drop those parts from the GPU budget"""
+    cfg = gemma_cfg(extra_args="--no-mmproj-offload")
+    cfg["embedding"]["gpu"] = False
+    p = deploy.gpu_memory_plan(cfg, gemma_files(), read_header=local_header)
+    assert not any(k.startswith(("embedding", "projector")) for k in p["parts_mib"]), p["parts_mib"]
+
+
+@case
+def check_validates_gpu_settings():
+    """check: ctx_min outside 256 per slot..ctx, an unknown cache type or a non-bool embedding.gpu are refused"""
+    raises(lambda: deploy.plan_settings(gemma_cfg(ctx_min=65536)), text="llama.ctx_min")
+    raises(lambda: deploy.plan_settings(gemma_cfg(ctx_min=256)), text="llama.ctx_min")
+    raises(lambda: deploy.plan_settings(gemma_cfg(cache_type="q9")), text="llama.cache_type")
+    cfg = gemma_cfg()
+    cfg["embedding"]["gpu"] = "yes"
+    raises(lambda: deploy.plan_settings(cfg), text="embedding.gpu")
+
+
+@case
+def gpu_settings_reach_the_worker_env():
+    """docker options carry ctx_min, image_tokens, embedding gpu and cache type to the worker"""
+    opts = deploy.docker_options(gemma_cfg(), PINS)
+    for kv in ("LLAMA_CTX_MIN=16384", "LLAMA_IMAGE_TOKENS=1120", "EMBED_GPU=1", "EMBED_CACHE_TYPE=f16"):
+        assert f"-e {kv}" in opts, kv
+    cfg = gemma_cfg()
+    cfg["embedding"]["gpu"] = False
+    assert "-e EMBED_GPU=0" in deploy.docker_options(cfg, PINS)
+
+
 @case
 def watch_ignores_unknown_status():
     """a status string the watchdog doesn't know is left alone"""

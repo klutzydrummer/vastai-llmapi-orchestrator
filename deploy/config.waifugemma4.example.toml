@@ -26,11 +26,16 @@ file        = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 revision    = "main"
 ctx         = 8192                        # longest single input, in tokens
 pooling     = "last"                      # Qwen3-Embedding uses last-token pooling
+gpu         = true                        # on the GPU next to the chat model; false = CPU (-ngl 0, slower, no VRAM)
+cache_type  = "f16"                       # its context cache; the worker drops to q8_0 (and ctx to 2048) if VRAM is short
 
 [llama]
 image            = "ghcr.io/ggml-org/llama.cpp:server-cuda-b11371"   # upstream llama.cpp, pinned build (CUDA 12.8)
 # Not every llama.cpp release gets an image; `check` names the newest older one if this tag is missing.
-ctx              = 32768     # total context; shared by all slots (--kv-unified)
+ctx              = 32768     # total context; shared by all slots (--kv-unified). A ceiling: never raised
+ctx_min          = 16384     # the worker lowers ctx toward this if the GPU's free memory is short, and fails
+                             # (before downloading) if even this doesn't fit; = ctx to never lower it
+image_tokens     = 1120      # tokens of the largest image; the batch size (-ub) is raised to this with a projector
 parallel         = 2         # slots; the Vast benchmark sends concurrent requests
 cache_type       = "q8_0"    # KV cache type for K and V
 reasoning_budget = 0         # the model card says run non-thinking

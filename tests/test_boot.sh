@@ -12,21 +12,21 @@ PASS=0; FAIL=0
 HF_PID=""; VAST_PID=""
 trap '[ -n "$HF_PID" ] && kill "$HF_PID" 2>/dev/null; [ -n "$VAST_PID" ] && kill "$VAST_PID" 2>/dev/null; pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/orch/router.py" 2>/dev/null; rm -rf "$WORK"' EXIT
 
-# fake weights: GGUF magic + filler
+# fake weights: real GGUF headers (small models, and the Gemma 4 projector's) + filler
 mkdir -p "$WORK/hub" "$WORK/bin"
-python3 - "$WORK/hub" <<'EOF'
-import os, sys
-d = sys.argv[1]
-for name, n in (("model.gguf", 3_000_000), ("mmproj.gguf", 400_000), ("embed.gguf", 200_000)):
-    with open(os.path.join(d, name), "wb") as f:
-        f.write(b"GGUF" + os.urandom(n))
-EOF
+python3 "$HERE/fakes/gguf.py" write "$WORK/hub/model.gguf" tiny 3000000
+python3 "$HERE/fakes/gguf.py" write "$WORK/hub/mmproj.gguf" gemma4-mmproj 400000
+python3 "$HERE/fakes/gguf.py" write "$WORK/hub/embed.gguf" tiny-embed 200000
 cp "$HERE/fakes/fake_llama_server.py" "$WORK/bin/llama-server"
 chmod +x "$WORK/bin/llama-server"
 cat > "$WORK/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
+total="${FAKE_VRAM_MB:-24576}"; used="${FAKE_VRAM_USED_MB:-300}"
 case "$*" in
-  *memory.total\ --format=csv,noheader,nounits*) echo "${FAKE_VRAM_MB:-24576}";;
+  *name,memory.used,memory.total\ --format=csv,noheader,nounits*) echo "FAKE GPU, $used, $total";;
+  *memory.free,memory.total\ --format=csv,noheader,nounits*) echo "${FAKE_VRAM_FREE_MB:-$((total - used))}, $total";;
+  *memory.total\ --format=csv,noheader,nounits*) echo "$total";;
+  *memory.used\ --format=csv,noheader,nounits*) echo "$used";;
   *) echo "FAKE GPU, ${FAKE_VRAM_MB:-24576} MiB, 999.99";;
 esac
 EOF
@@ -44,7 +44,7 @@ run_case(){
     local name="$1" expect="$2" timeout="$3"; shift 3
     local orch="$WORK/orch"
     mkdir -p "$orch"
-    cp "$REPO/worker/"{boot.sh,fetch_model.py,hf_download.py,smoke_test.py,router.py,pyworker_worker.py} "$orch/"
+    cp "$REPO/worker/"{boot.sh,fetch_model.py,hf_download.py,smoke_test.py,router.py,pyworker_worker.py,vram.py} "$orch/"
     rm -f "$orch/model.log" "$orch/model.log.prev" "$orch/console.log"
     pkill -f fake_llama_server.py 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; sleep 0.3
     env PATH="$WORK/bin:$PATH" ORCH_DIR="$orch" MODEL_LOG="$orch/model.log" \
@@ -65,6 +65,7 @@ run_case(){
         sleep 0.5
     done
     [ -n "$got" ] && sleep "${HOLD:-0}"
+    [ -n "$got" ] && [ -n "${ON_MARK:-}" ] && eval "$ON_MARK"
     kill -- -"$pid" 2>/dev/null; pkill -f "$WORK/bin/llama-server" 2>/dev/null; wait "$pid" 2>/dev/null
     if [ "$got" = "$expect" ]; then
         echo "PASS  $name ($got)"; PASS=$((PASS + 1))
@@ -123,7 +124,7 @@ run_case "boot deadline" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
 check "deadline failure names the step it was stuck at" grep -q "not ready within 6s (still at: loading the model)" "$LAST_LOG"
 check "deadline ORCH_FATAL reaches the container console" grep -q "ORCH_FATAL: not ready within 6s" "$LAST_CONSOLE"
 run_case "slow load prints progress" ready 40 FAKE_LLAMA_LOAD_SECS=5 LOAD_HEARTBEAT_S=1
-check "loading heartbeat reaches the console" grep -q "still loading after" "$LAST_CONSOLE"
+check "loading heartbeat reaches the console" grep -q "still loading llama-server after" "$LAST_CONSOLE"
 run_case "hung device listing times out" fatal 30 FAKE_LLAMA_MODE=hang_devices LIST_DEVICES_TIMEOUT=2
 check "says which step hung" grep -q "list-devices did not finish in 2s" "$LAST_LOG"
 start_hub --slow 4
@@ -204,6 +205,48 @@ run_case "chat server dies after ready, embedding keeps running" ready_then_fata
 grep -q "ORCH_FATAL: llama-server exited" "$LAST_LOG" \
     && { echo "PASS  the dead chat server is named"; PASS=$((PASS+1)); } \
     || { echo "FAIL  dead server not named"; FAIL=$((FAIL+1)); }
+
+# ── GPU memory: sized before the download, servers one after the other ─────────
+run_case "set that can't fit fails before downloading" fatal 30 FAKE_VRAM_FREE_MB=1200
+check "says it doesn't fit and by how much" grep -Eq "\[vram\] does NOT fit: [0-9]+ MiB short" "$LAST_CONSOLE"
+check "the fatal line names the GPU memory" grep -q "ORCH_FATAL: models don't fit in this GPU's free memory" "$LAST_LOG"
+check "nothing downloaded" bash -c "! grep -q '\[fetch\]' '$LAST_LOG'"
+run_case "chat args follow the plan" ready 60
+check "ubatch raised to the image tokens with a projector" grep -Eq "launching llama-server: .* -b 2048 -ub 1120 " "$LAST_LOG"
+check "chat context capped at trained context x slots" grep -Eq "launching llama-server: .* -c 8192 " "$LAST_LOG"
+check "llama-server output reaches the console, prefixed" grep -q "^\[chat\] main: model loaded" "$LAST_CONSOLE"
+check "llama.cpp's buffer sizes are logged next to the plan" grep -q "\[chat\] llama_kv_cache: *CUDA0 KV buffer size" "$LAST_LOG"
+run_case "CUDA out of memory loading the projector" fatal 30 FAKE_LLAMA_MODE=oom_mmproj
+check "ORCH_FATAL carries the out-of-memory line" \
+    grep -q "ORCH_FATAL: llama-server exited during load: .*cudaMalloc failed: out of memory" "$LAST_LOG"
+check "llama-server's own lines reach the console (vastai logs)" \
+    grep -q "^\[chat\] mtmd_init_from_file: error: Failed to load CLIP model" "$LAST_CONSOLE"
+check "and the chat log" grep -q "failed to load multimodal model" "$WORK/orch/chat.log"
+rm -f "$WORK/events"
+run_case "embedding server starts first, chat after its /health" ready 60 "${EMB[@]}" \
+    FAKE_EVENTS="$WORK/events" FAKE_EMBED_LOAD_SECS=3
+check "chat started only after the embedding server was healthy" \
+    bash -c "grep -n . '$WORK/events' | grep -E 'healthy embed|start chat' | head -2 | tr '\n' ' ' | grep -Eq '^[0-9]+:healthy embed [0-9]+:start chat'"
+check "VRAM after embedding is logged" grep -q "VRAM after embedding: 300 MiB used" "$LAST_LOG"
+check "embedding server on the GPU by default" grep -Eq "launching embedding llama-server: .* -ngl 999 -ctk f16 -ctv f16" "$LAST_LOG"
+ON_MARK='curl -s http://127.0.0.1:18000/orch/info > "$WORK/info.json"' \
+    run_case "router serves /orch/info for the status page" ready 60 "${EMB[@]}"
+check "info has slots, context per slot and total from llama-server" python3 -c "
+import json, sys; i = json.load(open('$WORK/info.json')); c = i['chat']
+assert (c['slots'], c['ctx_per_slot'], c['ctx_total'], c['ctx_train'], c['busy_slots']) == (2, 4096, 8192, 4096, 0), c
+assert i['embedding']['model'] == 'testembed' and i['memory_plan']['ctx'] == 8192 and i['gpu']['memory_total_mib'] == 24576, i"
+ON_MARK='curl -s http://127.0.0.1:18000/orch/info > "$WORK/info.json"' \
+    run_case "without an embedding model the router still fronts chat" ready 60
+check "info without embedding" python3 -c "
+import json; i = json.load(open('$WORK/info.json')); assert 'embedding' not in i and i['chat']['model'] == 'testmodel', i"
+run_case "[embedding] gpu = false" ready 60 "${EMB[@]}" EMBED_GPU=false
+check "embedding server gets -ngl 0 and no cache type" \
+    bash -c "grep 'launching embedding llama-server' '$LAST_LOG' | grep -q -- '-ngl 0' && ! grep 'launching embedding llama-server' '$LAST_LOG' | grep -q -- '-ctk'"
+check "no embedding reservation in the plan" bash -c "! grep -q '\[vram\] embedding weights' '$LAST_LOG'"
+start_hub --no-ranges
+run_case "Hub headers unreadable: sized from the downloaded files" ready 60
+check "says it falls back" grep -q "checking the downloaded files instead" "$LAST_LOG"
+start_hub
 
 rm -rf "$WORK/models"
 start_hub --corrupt model.gguf
