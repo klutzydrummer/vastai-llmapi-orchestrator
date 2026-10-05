@@ -1396,12 +1396,44 @@ def _host_key(row):
     return f"offer={row.get('id')}"
 
 
+def _vast_error_text(e):
+    """What Vast said when a call failed: status and body, if there was a response."""
+    r = getattr(e, "response", None)
+    if r is None:
+        return f"{type(e).__name__}: {e}"
+    try:
+        body = r.text.strip()
+    except Exception:
+        body = ""
+    return f"HTTP {r.status_code}: {body[:500] or '(empty body)'}"
+
+
+def _rentable_offers(v, cfg, exclude_hosts=(), exclude_offers=(), limit=10):
+    """Offers matching the config right now, cheapest first."""
+    w, t = cfg["workergroup"], cfg["template"]
+    rows = _rows(v.search_offers(query=w["search_params"] + " rented=False", order="dph_total",
+                                 limit=limit, storage=t["disk_gb"]), "search_offers")
+    rows = [o for o in rows if _host_key(o) not in exclude_hosts and o.get("id") not in exclude_offers]
+    return sorted(rows, key=lambda o: float(o.get("dph_total") or 0))
+
+
+def _offer_line(o):
+    return f"offer {o.get('id')} {o.get('gpu_name', '?')} ${float(o.get('dph_total') or 0):.3f}/hr"
+
+
 def cmd_rent_test(cfg, args):
     """Rent one instance outside serverless (no PyWorker) to prove a config,
     recording the id Vast returns so status, sweep, watch and destroy know it.
     Then follow its boot; if it fails because of its host (see host_failed),
     save its log, destroy it, and rent the next cheapest other host, up to
-    limits.rent_attempts rentals in all."""
+    limits.rent_attempts rentals in all.
+
+    Offers are searched again right before each create, since the preflight
+    and the prompt can take minutes. If Vast refuses the create, what it said
+    is printed, and the account is checked for an instance that appeared
+    anyway (stop, never retry, if one did). If the offer is then no longer
+    listed, someone else took it: the next offer is tried, counting as an
+    attempt. A refusal of an offer that is still listed stops the command."""
     v = vast()
     say("preflight")
     pins = check(cfg, v)
@@ -1409,33 +1441,61 @@ def cmd_rent_test(cfg, args):
     attempts = max(1, int(cfg["limits"].get("rent_attempts", 3)))
     follow = not getattr(args, "no_follow", False)
     opts = docker_options(cfg, pins) + f" -e ORCH_SKIP_PYWORKER=1 -e ORCH_MANUAL_TTL={ttl}"
-    t, w = cfg["template"], cfg["workergroup"]
+    t = cfg["template"]
     label = f"orch-test:{cfg['endpoint']['name']}"
-    bad_hosts = []
-    for attempt in range(1, attempts + 1):
-        offers = [o for o in _rows(v.search_offers(query=w["search_params"] + " rented=False",
-                                                   order="dph_total", limit=10, storage=t["disk_gb"]),
-                                   "search_offers") if _host_key(o) not in bad_hosts]
+    bad_hosts, gone_offers, failures = [], set(), []
+
+    def cheapest():
+        offers = _rentable_offers(v, cfg, bad_hosts, gone_offers)
         if not offers:
             raise CheckFailed("no offer matches workergroup.search_params right now"
-                              + (f" apart from hosts that failed: {', '.join(bad_hosts)}" if bad_hosts else ""))
-        o = min(offers, key=lambda o: float(o.get("dph_total") or 0))
-        say(f"cheapest match: offer {o.get('id')} {o.get('gpu_name', '?')} ${float(o.get('dph_total') or 0):.3f}/hr"
-            + (f" (rental {attempt} of up to {attempts})" if attempt > 1 else ""))
+                              + (f" apart from hosts that failed: {', '.join(bad_hosts)}" if bad_hosts else "")
+                              + (f" and offers already taken: {', '.join(map(str, sorted(gone_offers)))}"
+                                 if gone_offers else ""))
+        return offers[0]
+
+    for attempt in range(1, attempts + 1):
+        o = cheapest()
+        say(f"cheapest match: {_offer_line(o)}" + (f" (rental {attempt} of up to {attempts})" if attempt > 1 else ""))
         if args.dry_run:
             say("docker options:\n  " + opts + "\ndry run: nothing rented")
             return
         if attempt == 1:
-            again = (f" If a host fails to boot it is destroyed and another rented, up to {attempts} in all."
-                     if follow and attempts > 1 else "")
+            again = (f" If a host fails to boot or its offer is taken, another is tried, up to {attempts} in all."
+                     if attempts > 1 else "")
             if not confirm(f"rent it? It stops itself after {ttl}s; `deploy.py destroy` or `sweep` removes it."
                            + again, args.yes):
                 return
         with StateLock():
+            # The offer list may be minutes old by now (preflight, prompt, the last boot).
+            fresh = cheapest()
+            if fresh.get("id") != o.get("id"):
+                say(f"offers changed; renting {_offer_line(fresh)} instead (within search_params)")
+            o = fresh
             st = load_state()
-            res = v.create_instance(o["id"], image=cfg["llama"]["image"], disk=float(t["disk_gb"]), env=opts,
-                                    onstart_cmd=onstart_script(), label=label, ssh=True, direct=True,
-                                    cancel_unavail=True)
+            before = {i.get("id") for i in _rows(v.show_instances(), "show_instances")}
+            try:
+                res = v.create_instance(o["id"], image=cfg["llama"]["image"], disk=float(t["disk_gb"]), env=opts,
+                                        onstart_cmd=onstart_script(), label=label, ssh=True, direct=True,
+                                        cancel_unavail=True)
+            except requests.RequestException as e:
+                said = _vast_error_text(e)
+                say(f"Vast refused offer {o['id']}: {said}")
+                # Decide from what Vast reports: did an instance appear anyway?
+                new = [i for i in _rows(v.show_instances(), "show_instances") if i.get("id") not in before]
+                if new:
+                    raise ApiError(f"create_instance for offer {o['id']} failed ({said}), but the account now has "
+                                   f"instance(s) it didn't have before: {', '.join(_describe(i) for i in new)}. "
+                                   "Not recorded and not retried; check them and destroy with "
+                                   "`deploy.py sweep --destroy ID`")
+                listed = any(r.get("id") == o["id"] for r in _rentable_offers(v, cfg, limit=64))
+                if listed:
+                    raise CheckFailed(f"Vast refused offer {o['id']}, which is still listed, so retrying another "
+                                      f"offer may fail the same way. Nothing was rented. Vast said: {said}")
+                say(f"offer {o['id']} is no longer listed (most likely taken); nothing was rented")
+                gone_offers.add(o["id"])
+                failures.append(f"offer {o['id']} taken")
+                continue
             iid = res.get("new_contract") if isinstance(res, dict) else None
             if not isinstance(iid, int):
                 raise ApiError(f"create_instance returned no instance id: {str(res)[:300]}. Check the dashboard "
@@ -1462,14 +1522,15 @@ def cmd_rent_test(cfg, args):
             raise CheckFailed(f"instance {iid} did not boot ({result}); see the log above. It was left as is: "
                               f"`deploy.py sweep --destroy {iid}` removes it")
         bad_hosts.append(_host_key(o))
+        failures.append(f"instance {iid} failed on {_host_key(o)}")
         say(f"instance {iid} failed because of its host ({result}); destroying it")
         with StateLock():
             destroy_and_wait(v, [iid])
             st = load_state()
             st.get("manual_instances", {}).pop(str(iid), None)
             save_state(st)
-    raise CheckFailed(f"{attempts} rentals failed to boot on their hosts ({', '.join(bad_hosts)}); "
-                      "nothing is left running. See the saved boot logs")
+    raise CheckFailed(f"{attempts} attempts failed ({'; '.join(failures)}); nothing is left running. "
+                      "See the saved boot logs")
 
 
 # ── watch ────────────────────────────────────────────────────────────────────
