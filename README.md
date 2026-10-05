@@ -304,18 +304,19 @@ shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
 
-**Warm hours.** Set `WARM_HOURS` (for example `14:30-23:00`) and `WARM_TZ` (for
-example `America/Chicago`) in `shim/.env`, and the shim keeps one worker
-awake during those hours: it sends a 1-token request every `WARM_PING_S`
-(300 s), under the endpoint's `inactivity_timeout`, so the worker is never
-released. The pings go to the embedding model, a separate llama-server, so
-the chat model's prompt cache for each conversation is left alone (without
-`EMBED_MODEL_NAME` they'd use the chat model and could evict one). It sends one at a time, so a ping waiting on a cold start isn't
-doubled up. Outside the hours nothing is sent and the worker idles out as usual. Start the window
-about 25 minutes before you need it, since the first ping pays the cold start.
-While warm, a worker bills its full rate (a 3090 at about $0.17/hr is about
-$1.40 for 8 hours). It's off by default; `GET /status` shows whether it's on
-and how the last ping went.
+**Warm hours.** Set `endpoint.warm_hours` (for example `"14:30-23:00"`) and
+`endpoint.warm_tz` (for example `"America/Chicago"`; the machine's clock,
+usually UTC in Docker, when unset) and `watch` keeps one worker running during
+those hours. At the start of the window it raises the endpoint's `min_load` to
+`warm_min_load` (1), so the autoscaler holds a worker up with no traffic
+instead of releasing it after `inactivity_timeout`; at the end it puts
+`min_load` back, and the worker idles out as usual. Each change is read back,
+and `apply`, `pause` and `resume` send the value for the current time, so none
+of them undoes it. No requests are sent, so llama.cpp's prompt cache is left
+alone. Start the window about 25 minutes before you need it, since the first
+worker pays the cold start. While warm, a worker bills its full rate (a 3090
+at about $0.17/hr is about $1.40 for 8 hours). Off by default; `orch status`
+shows the workers.
 
 ## Tuning
 

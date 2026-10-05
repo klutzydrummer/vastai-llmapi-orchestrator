@@ -622,6 +622,63 @@ def watch_destroys_worker_stuck_booting():
     assert [c[1] for c in v.made("destroy_instance")] == [1], (acts, v.calls)
 
 
+def warm_cfg(**endpoint):
+    cfg = copy.deepcopy(BASE_CFG)
+    cfg["endpoint"].update({"warm_hours": "15:00-23:00", "warm_tz": "UTC", **endpoint})
+    return cfg
+
+
+def utc(h, m=0):
+    import datetime as dt
+    return dt.datetime(2026, 10, 5, h, m, tzinfo=dt.timezone.utc).timestamp()
+
+
+@case
+def warm_hours_hold_min_load_through_watch():
+    """warm hours: watch raises endpoint min_load at the start, reads it back, leaves it, and restores it after"""
+    cfg = warm_cfg()
+    v = FakeVast()
+    deploy._apply(v, cfg, PINS, "-p 3000:3000")
+    v.calls.clear()
+    def wtick(now, c=cfg):
+        st = deploy.load_state()
+        out = deploy.watch_tick(v, c, st, now)
+        deploy.save_state(st)
+        return out
+    acts = wtick(utc(16))
+    (_, _, kw), = v.made("update_endpoint")
+    assert kw["min_load"] == 1 and kw["max_workers"] == cfg["endpoint"]["max_workers"], kw
+    assert v.endpoints[0]["min_load"] == 1 and "warm hours on" in acts[0], acts
+    v.calls.clear()
+    assert not wtick(utc(22, 59)) and not v.made("update_endpoint")
+    # someone changed it behind our back: put back
+    v.endpoints[0]["min_load"] = 0
+    wtick(utc(17))
+    assert v.endpoints[0]["min_load"] == 1
+    acts = wtick(utc(23, 0))
+    assert v.endpoints[0]["min_load"] == cfg["endpoint"]["min_load"] and "warm hours off" in acts[-1], acts
+    # pause/resume during warm hours send the warm value, so they don't undo it
+    assert deploy.endpoint_limits(cfg, utc(15))["min_load"] == 1
+    assert deploy.endpoint_limits(cfg, utc(14, 59))["min_load"] == cfg["endpoint"]["min_load"]
+    # windows may cross midnight; no warm_hours means nothing changes
+    assert deploy.warm_now(warm_cfg(warm_hours="22:00-02:00"), utc(1, 30))
+    assert not deploy.warm_now(warm_cfg(warm_hours="22:00-02:00"), utc(2))
+    v.calls.clear()
+    plain = copy.deepcopy(BASE_CFG)
+    wtick(utc(16), plain)
+    assert not v.made("update_endpoint") and "warm_active" not in deploy.load_state()
+
+
+@case
+def warm_hours_settings_are_checked():
+    """bad warm_hours, warm_tz or warm_min_load are refused before anything runs"""
+    raises(lambda: deploy.check_limits(warm_cfg(warm_hours="3pm-11pm")), deploy.CheckFailed, "warm_hours")
+    raises(lambda: deploy.check_limits(warm_cfg(warm_hours="15:00-15:00")), deploy.CheckFailed, "empty")
+    raises(lambda: deploy.check_limits(warm_cfg(warm_tz="Mars/Olympus")), deploy.CheckFailed, "warm_tz")
+    raises(lambda: deploy.check_limits(warm_cfg(warm_min_load=0)), deploy.CheckFailed, "warm_min_load")
+    deploy.check_limits(warm_cfg())
+
+
 @case
 def watch_ignores_unknown_status():
     """a status string the watchdog doesn't know is left alone"""

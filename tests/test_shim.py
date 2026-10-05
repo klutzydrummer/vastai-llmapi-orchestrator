@@ -192,66 +192,6 @@ async def main():
     ok("/v1/embeddings reaches the worker with the embedding model's name")
     await runner.cleanup()
 
-    # warm hours: parsing, including ranges across midnight
-    from datetime import datetime
-    w = shim_mod.parse_warm_hours("15:00-23:00, 22:30-01:00")
-    assert w == [(900, 1380), (1350, 60)], w
-    at = lambda hm: datetime(2026, 10, 5, *hm)
-    assert shim_mod.in_warm_hours(w, at((15, 0))) and shim_mod.in_warm_hours(w, at((0, 30)))
-    assert not shim_mod.in_warm_hours(w, at((14, 59))) and not shim_mod.in_warm_hours(w, at((1, 0)))
-    assert shim_mod.parse_warm_hours("") == [] and shim_mod.parse_warm_hours("00:00-24:00") == [(0, 1440)]
-    for bad in ("3pm-11pm", "15:00", "15:00-15:00", "25:00-26:00"):
-        try:
-            shim_mod.parse_warm_hours(bad)
-            raise AssertionError(f"{bad!r} accepted")
-        except SystemExit:
-            pass
-    ok("WARM_HOURS parsed, midnight-crossing ranges included, bad input refused")
-
-    # inside warm hours: minimal pings keep a worker awake, reported in /status
-    n0 = len(fake.received)
-    s, runner = await make_shim(warm_hours=[(0, 1440)], warm_ping_s=0.3)
-    await asyncio.sleep(1.2)
-    pings = fake.received[n0:]
-    assert len(pings) >= 3 and all(p == {"model": "waifu", "prompt": "hi", "max_tokens": 1} for p in pings), pings
-    async with ClientSession() as http:
-        async with http.get(base + "/status") as r:
-            warm = (await r.json())["warm"]
-    assert warm["active"] and warm["last_ping"] == "ok", warm
-    await runner.cleanup()
-    ok("warm hours: a worker is pinged awake and /status shows it")
-
-    # with an embedding model, pings go to it and leave the chat model's prompt cache alone
-    n0 = len(fake.received)
-    s, runner = await make_shim(warm_hours=[(0, 1440)], warm_ping_s=0.3, embed_model_name="qwen3-embed")
-    await asyncio.sleep(0.8)
-    pings = fake.received[n0:]
-    assert pings and all(p == {"model": "qwen3-embed", "input": "hi"} for p in pings), pings
-    await runner.cleanup()
-    ok("warm pings use the embedding model when there is one")
-
-    # a ping waiting on a cold start is not doubled up
-    fake.ready_at = time.time() + 1.5
-    n0 = len(fake.received)
-    s, runner = await make_shim(warm_hours=[(0, 1440)], warm_ping_s=0.2)
-    await asyncio.sleep(1.2)
-    assert len(fake.received) == n0 and s.warm["pings"] == 1, (s.warm, fake.received[n0:])
-    await asyncio.sleep(1.5)
-    assert len(fake.received) > n0 and s.warm["last_ping"] == "ok", s.warm
-    await runner.cleanup()
-    fake.ready_at = 0
-    ok("warm hours: one ping at a time while a worker starts")
-
-    # outside warm hours: nothing is sent
-    n0 = len(fake.received)
-    now = datetime.now().astimezone()
-    start = (now.hour * 60 + now.minute + 120) % 1440
-    s, runner = await make_shim(warm_hours=[(start, (start + 60) % 1440)], warm_ping_s=0.2)
-    await asyncio.sleep(0.8)
-    assert len(fake.received) == n0 and not s.warm["active"], fake.received[n0:]
-    await runner.cleanup()
-    ok("outside warm hours no worker is woken")
-
     # auth
     s, runner = await make_shim(shim_api_key="secret")
     async with ClientSession() as http:
