@@ -30,9 +30,10 @@ the autoscaler drops that worker instead of billing for it.
 | Stage | Check | On failure |
 | --- | --- | --- |
 | before download | `nvidia-smi` shows ≥ `min_vram_gb`; `llama-server --list-devices` sees CUDA (catches driver/image mismatch) | fatal, nothing downloaded |
+| before download | the models fit in the GPU's **free** memory, from their GGUF headers (see **GPU memory**) | fatal, nothing downloaded, says by how much |
 | download | file exists at the **pinned commit** on the Hub; enough disk; after 90 s, the projected finish at the last minute's speed is within `download_max_s` | fatal (a download with no data for 2 minutes is restarted first) |
 | verify | size + **sha256 match the Hub's LFS hash**; GGUF magic bytes | file deleted, fatal |
-| load | `llama-server` stays alive and `/health` goes 200 within `load_timeout_s` | fatal |
+| load | the embedding server, then the chat server (sized from the memory left), stay alive and `/health` goes 200 within `load_timeout_s` | fatal, with llama-server's own error line |
 | smoke test | `/props` reports vision on; a text request and a **real image request** both return text; with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
 | deadline | the boot, not counting the download, finishes within `deadline_s` | fatal, naming the step it was stuck at |
 | serving | `llama-server` exits later | fatal |
@@ -122,9 +123,11 @@ worker/onstart.sh       template on-start: fetches the worker scripts at the pin
 worker/boot.sh          the boot sequence above
 worker/fetch_model.py   Hub lookup, resumable download (aria2c, curl fallback), sha256 verify
 worker/smoke_test.py    /props + text + image (+ embedding) checks
-worker/router.py        sends /v1/embeddings to the embedding llama-server, the rest to chat
-worker/pyworker_worker.py  Vast's llama PyWorker routes plus /v1/embeddings
+worker/vram.py          GGUF header reader and GPU memory planner (also used by `deploy.py check`)
+worker/router.py        sends /v1/embeddings to the embedding llama-server, the rest to chat; /orch/info
+worker/pyworker_worker.py  Vast's llama PyWorker routes plus /v1/embeddings and /orch/info
 shim/shim.py            OpenAI-compatible proxy (vastai SDK client)
+shim/status.html        status page: API URL, model, slots, context per slot, copy buttons
 deploy/deploy.py        preflight, template / endpoint / workergroup, rent-test, sweep, watch, destroy
 deploy/orch-watch.service  systemd unit for `deploy.py watch`
 Dockerfile, compose.yaml   one image: shim, watchdog and deploy CLI
@@ -304,6 +307,16 @@ shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
 
+**Status page.** Open `http://<homelab>:8787/` for everything SillyTavern
+asks for, each with a Copy button: the API URL, model ids, whether a key is
+needed, context per slot (SillyTavern's Context Size), slots, total and
+trained context, image support, the embedding model's input limit and
+dimensions, and the worker's GPU and memory plan. It asks the worker only
+when the autoscaler lists one as running, so opening the page never starts a
+GPU; otherwise it shows the last answer and how old it is (kept in
+`shim/.info-cache.json` across restarts, `INFO_CACHE` to move it). With
+`SHIM_API_KEY` set the page asks for the key once and keeps it in the browser.
+
 **Warm hours.** Set `endpoint.warm_hours` (for example `"14:30-23:00"`) and
 `endpoint.warm_tz` (for example `"America/Chicago"`; the machine's clock,
 usually UTC in Docker, when unset) and `watch` keeps one worker running during
@@ -318,11 +331,49 @@ worker pays the cold start. While warm, a worker bills its full rate (a 3090
 at about $0.17/hr is about $1.40 for 8 hours). Off by default; `orch status`
 shows the workers.
 
+## GPU memory
+
+Every worker works out what fits before it downloads anything. `worker/vram.py`
+reads the GGUF headers of the chat model, projector and embedding model from
+the Hub (a few MB each, by HTTP range request) and adds up, per server: the
+weights, the context cache (per layer, so Gemma's sliding-window layers and
+per-layer KV heads count correctly; older headers use the plain formula), the
+compute buffer (llama.cpp reserves logits for a whole batch), the projector
+and its vision encoder, a CUDA context per process and a margin
+(256 MiB + 3% of the card). If that's more than the GPU's free memory it
+gives up, in order: embedding context (halved down to 2048), embedding cache
+precision (f16 to q8_0), then chat context (down to `llama.ctx_min`). If even
+that doesn't fit, the boot fails before downloading and says by how much.
+`llama.ctx` is a ceiling and is never raised; it is also capped at the trained
+context times `parallel`.
+
+The servers start one at a time: the embedding server first, then, once its
+`/health` answers, the chat server is sized again from the memory actually
+left (`[boot] VRAM after embedding: X MiB used`). Each server's output goes to
+`vastai logs` (and so `orch logs` and `deploy/boots/<id>.log`) prefixed
+`[chat]` / `[embed]`, all of it while loading and warnings and errors after
+that, and to `/workspace/orch/chat.log` and `embed.log`. After loading, the
+boot logs llama.cpp's own buffer sizes and what each server added to
+`nvidia-smi`'s used memory next to the estimate.
+
+With a projector the batch size (`-ub`) is raised to `llama.image_tokens`
+(1120 for Gemma 4), since a smaller batch cuts images down. The embedding
+model runs on the GPU; `embedding.gpu = false` moves it to the CPU (`-ngl 0`,
+nothing reserved for it).
+
+`deploy.py check` runs the same plan for the smallest GPU your
+`search_params` (`gpu_ram>=`) and `min_vram_gb` allow, prints the breakdown,
+and fails if it doesn't fit, listing the options: a larger GPU, a lower
+`llama.ctx_min`, the projector in system RAM (`--no-mmproj-offload` in
+`llama.extra_args`) or the embedding model on the CPU. It doesn't pick one
+for you.
+
 ## Tuning
 
 - **Context:** `llama.ctx` is shared across `parallel` slots (`--kv-unified`),
   so one long chat can use all of it. A larger context costs VRAM for the KV
-  cache; raise `min_vram_gb` and `gpu_ram` with it.
+  cache; `check` shows whether it fits, and the worker lowers it toward
+  `llama.ctx_min` when a card has less free memory than planned.
 - **Price vs speed:** loosen or tighten `search_params`. `inet_down` matters
   because a slow host bills you for every minute spent downloading.
 - **Quant:** change `model.file`; `check` confirms it exists and that disk fits.

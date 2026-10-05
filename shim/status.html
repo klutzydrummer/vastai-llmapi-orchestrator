@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM endpoint status</title>
+<style>
+  :root { --bg: #f7f7f5; --card: #fff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e3e3de;
+          --accent: #2f6fdb; --ok: #1f8a4c; --warn: #b26a00; --bad: #c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --card: #20201e; --fg: #ececea; --muted: #a0a09a; --line: #34342f;
+            --accent: #6d9cf0; --ok: #4cc27f; --warn: #e0a040; --bad: #ef6b5b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+       margin: 24px 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .row { display: grid; grid-template-columns: minmax(120px, 38%) 1fr auto; gap: 12px; align-items: center;
+         padding: 10px 14px; border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .k { color: var(--muted); }
+  .v { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px;
+       overflow-wrap: anywhere; }
+  .hint { display: block; font-family: system-ui, sans-serif; font-size: 12px; color: var(--muted); }
+  button { font: inherit; font-size: 13px; color: var(--accent); background: transparent;
+           border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+          border: 1px solid currentColor; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  #key { display: none; margin: 12px 0; }
+  #key input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px;
+               background: var(--card); color: var(--fg); width: 260px; max-width: 100%; }
+  @media (max-width: 520px) { .row { grid-template-columns: 1fr auto; } .k { grid-column: 1 / -1; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>LLM endpoint status</h1>
+  <p class="sub" id="state">Loading…</p>
+  <div class="bar">
+    <button class="primary" id="copyall">Copy all</button>
+    <button id="refresh">Refresh</button>
+    <button id="wake" title="Asks the autoscaler for a worker; a GPU is billed while it runs">Start a worker</button>
+  </div>
+  <div id="key">
+    <label>Shim API key <input id="keyin" type="password" autocomplete="off"></label>
+    <button id="keysave">Use key</button>
+  </div>
+  <div id="sections"></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let key = "";
+try { key = localStorage.getItem("shimKey") || ""; } catch (e) {}
+let lastText = "";
+
+function ago(t) {
+  if (!t) return "never";
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  if (s < 90) return s + " s ago";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  if (s < 172800) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " days ago";
+}
+function copy(text, btn) {
+  const done = () => { const t = btn.textContent; btn.textContent = "Copied"; setTimeout(() => btn.textContent = t, 1200); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, () => fallback(text) && done());
+  } else if (fallback(text)) { done(); }
+}
+function fallback(text) {   // plain-http pages have no clipboard API
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  let ok = false; try { ok = document.execCommand("copy"); } catch (e) {}
+  ta.remove(); return ok;
+}
+function headers() { return key ? { Authorization: "Bearer " + key } : {}; }
+
+function render(d) {
+  const live = d.live || {}, chat = live.chat || {}, emb = live.embedding || null;
+  const plan = live.memory_plan || {}, gpu = live.gpu || null;
+  const base = location.origin + "/v1";
+  const sections = [
+    ["Connect (SillyTavern: Chat Completion, Custom OpenAI-compatible)", [
+      ["API URL", base, "Custom Endpoint (Base URL)"],
+      ["Model", d.models.chat, "Model ID"],
+      ["API key", d.api_key_required ? "required: the shim's SHIM_API_KEY" : "none needed", null, ""],
+    ]],
+    ["Context", [
+      ["Context per slot", chat.ctx_per_slot, "SillyTavern Context Size: the most one chat can use"],
+      ["Slots", chat.slots, "requests served at once; the context is split between them"],
+      ["Max context (all slots)", chat.ctx_total],
+      ["Trained context", chat.ctx_train],
+      ["Busy slots", chat.busy_slots],
+      ["Image input", chat.slots == null ? null : (chat.vision ? "yes" : "no")],
+    ]],
+  ];
+  if (d.models.embedding) {
+    sections.push(["Embeddings (Vector Storage: OpenAI-compatible, same URL)", [
+      ["Embedding model", d.models.embedding],
+      ["Embedding URL", base + "/embeddings"],
+      ["Max input tokens", emb && emb.ctx_per_slot],
+      ["Dimensions", emb && emb.n_embd],
+    ]]);
+  }
+  const notes = (plan.notes || []).concat(plan.levers && plan.levers.length ? ["to fit: " + plan.levers.join(", ")] : []);
+  sections.push(["Worker", [
+    ["GPU", gpu && (gpu.name + ", " + gpu.memory_used_mib + " / " + gpu.memory_total_mib + " MiB used")],
+    ["Memory plan", plan.need_mib != null ? plan.need_mib + " MiB planned of " + plan.free_mib + " MiB free" : null,
+     notes.join("; ") || null],
+    ["Chat model file", chat.model_path && chat.model_path.split("/").pop()],
+    ["llama.cpp build", chat.build],
+    ["Workers", (d.workers || []).map(w => w.id + " " + w.status).join(", ") || (d.workers_error ? "unknown: " + d.workers_error : "none running")],
+  ]]);
+
+  const host = $("sections"); host.textContent = "";
+  const lines = [];
+  for (const [title, rows] of sections) {
+    const h = document.createElement("h2"); h.textContent = title; host.appendChild(h);
+    const card = document.createElement("div"); card.className = "card";
+    lines.push("# " + title);
+    for (const [k, v, hint, copyAs] of rows) {
+      const shown = v == null || v === "" ? "—" : String(v);
+      const row = document.createElement("div"); row.className = "row";
+      const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+      const vv = document.createElement("div"); vv.className = "v"; vv.textContent = shown;
+      if (hint) { const s = document.createElement("span"); s.className = "hint"; s.textContent = hint; vv.appendChild(s); }
+      row.append(kk, vv);
+      const val = copyAs !== undefined && copyAs !== null ? copyAs : (v == null ? "" : String(v));
+      if (val !== "") {
+        const b = document.createElement("button"); b.textContent = "Copy";
+        b.onclick = () => copy(val, b); row.appendChild(b);
+      } else { row.appendChild(document.createElement("span")); }
+      card.appendChild(row);
+      lines.push(k + ": " + shown);
+    }
+    host.appendChild(card);
+  }
+  lastText = lines.join("\n");
+
+  const st = $("state");
+  if (d.live_fresh) {
+    st.innerHTML = '<span class="pill ok">live</span> from the running worker, ' + ago(d.live_at);
+  } else if (d.live) {
+    st.innerHTML = '<span class="pill warn">last seen</span> ' + ago(d.live_at) +
+      "; no worker answered just now, so these are the values from the last boot it saw";
+  } else {
+    st.innerHTML = '<span class="pill warn">no worker yet</span> context and slots appear once a worker has run';
+  }
+  if (d.live_error) st.innerHTML += ' <span class="bad">(' + d.live_error.replace(/[<>&]/g, "") + ")</span>";
+}
+
+async function load() {
+  try {
+    const r = await fetch("info.json", { headers: headers(), cache: "no-store" });
+    if (r.status === 401) { $("key").style.display = "block"; $("state").textContent = "This shim needs its API key."; return; }
+    $("key").style.display = "none";
+    render(await r.json());
+  } catch (e) { $("state").textContent = "Can't reach the shim: " + e; }
+}
+$("refresh").onclick = load;
+$("copyall").onclick = (ev) => copy(lastText, ev.target);
+$("wake").onclick = async (ev) => {
+  const b = ev.target;
+  const r = await fetch("wake", { method: "POST", headers: headers() });
+  b.textContent = r.ok ? "Worker requested" : "Failed (" + r.status + ")";
+  setTimeout(() => b.textContent = "Start a worker", 3000);
+};
+$("keysave").onclick = () => {
+  key = $("keyin").value.trim();
+  try { localStorage.setItem("shimKey", key); } catch (e) {}
+  load();
+};
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

@@ -21,8 +21,9 @@ run(){ local limit="$1"; shift
     timeout --kill-after=10 "$limit" "$@" || { rc=$?; [ $rc -eq 124 ] && echo "TIMEOUT after ${limit}s: $*" >&2; exit $rc; }
 }
 bash -n worker/boot.sh worker/onstart.sh
-python3 -m py_compile worker/fetch_model.py worker/smoke_test.py shim/shim.py deploy/deploy.py
+python3 -m py_compile worker/fetch_model.py worker/smoke_test.py worker/vram.py worker/router.py shim/shim.py deploy/deploy.py
 run 600 bash tests/test_boot.sh
 run 120 python3 tests/test_shim.py
 run 120 python3 tests/test_deploy.py
 run 60 python3 tests/test_fetch.py
+run 60 python3 tests/test_vram.py

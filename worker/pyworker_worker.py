@@ -1,4 +1,4 @@
-"""PyWorker entry point: Vast's llama worker plus a /v1/embeddings route.
+"""PyWorker entry point: Vast's llama worker plus /v1/embeddings and /orch/info.
 
 boot.sh copies this file to $WORKSPACE_DIR/vast-pyworker/worker.py, inside a
 checkout of vast-ai/pyworker at the pinned PYWORKER_REF. That ref's
@@ -8,8 +8,9 @@ root, before falling back to workers/$BACKEND/worker.py.
 Everything except the extra route is workers/openai/core.py's run() at that
 ref, using its own request parser and benchmark, so the chat routes behave
 exactly like the stock llama worker. Requests on all routes go to the model
-server on 127.0.0.1:18000, which is llama-server itself or, with an embedding
-model, worker/router.py in front of the two llama-servers.
+server on 127.0.0.1:18000, worker/router.py in front of the llama-servers;
+/orch/info is answered by the router itself (slots, context per slot, the
+memory plan) for the shim's status page.
 """
 
 import os
@@ -59,6 +60,13 @@ def main():
             request_parser=request_parser,
             max_queue_time=600.0,
         ))
+    handlers.append(HandlerConfig(
+        route="/orch/info",
+        workload_calculator=lambda data: 1.0,
+        allow_parallel_requests=True,
+        request_parser=request_parser,
+        max_queue_time=30.0,
+    ))
     print(f"orch pyworker: routes {[h.route for h in handlers]}", flush=True)
     Worker(WorkerConfig(
         model_server_url=MODEL_SERVER_URL,

@@ -14,6 +14,12 @@ Endpoints:
   GET  /v1/models                              answered locally, never wakes a GPU
   POST /wake                                   start a worker ahead of use
   GET  /status                                 worker states from the autoscaler
+  GET  /, /info                                status page for people: URL, model,
+                                               slots, context per slot, with copy
+                                               buttons (shim/status.html)
+  GET  /info.json                              what that page shows; asks a worker
+                                               only when one is running, so it
+                                               never starts a GPU
   GET  /health                                 the shim itself
 
 Configuration is by environment variable; see config.example.env.
@@ -51,6 +57,8 @@ class Config:
     nonstream_keepalive: bool = True
     fast_fail_window: float = 1.5
     max_retries: int = 3              # worker 5xx/429 retries before giving up
+    info_cache: str = ""              # last worker info, kept across restarts; "" = memory only
+    info_timeout: float = 20.0        # how long the status page waits on a running worker
 
     @classmethod
     def from_env(cls):
@@ -72,6 +80,9 @@ class Config:
             default_cost=int(os.environ.get("DEFAULT_COST", "512")),
             nonstream_keepalive=_env_bool("NONSTREAM_KEEPALIVE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "3")),
+            info_cache=os.environ.get("INFO_CACHE", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                   ".info-cache.json")),
+            info_timeout=float(os.environ.get("INFO_TIMEOUT", "20")),
         )
 
 
@@ -93,6 +104,13 @@ class Shim:
         self._endpoint = endpoint
         self._endpoint_lock = asyncio.Lock()
         self.stats = {"requests": 0, "errors": 0, "last_wait_s": None, "last_ok_at": None}
+        self._info, self._info_at, self._info_lock = None, 0.0, asyncio.Lock()
+        try:
+            with open(cfg.info_cache) as f:
+                saved = json.load(f)
+            self._info, self._info_at = saved["info"], float(saved["at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def start(self, app):
@@ -138,11 +156,12 @@ class Shim:
                 return int(v)
         return self.cfg.default_cost
 
-    async def _dispatch(self, route, body, stream):
+    async def _dispatch(self, route, body, stream, cost=None, timeout=None):
         """Route to a worker and return the SDK result dict; raise UpstreamError."""
         ep = await self.endpoint()
         attempts = 0
         t0 = time.time()
+        timeout = timeout or self.cfg.request_timeout
         while True:
             attempts += 1
             try:
@@ -150,18 +169,18 @@ class Shim:
                     endpoint=ep,
                     worker_route=route,
                     worker_payload=body,
-                    cost=self._cost(body),
-                    timeout=self.cfg.request_timeout,
+                    cost=cost or self._cost(body),
+                    timeout=timeout,
                     worker_timeout=self.cfg.worker_timeout,
                     stream=stream,
                     max_retries=self.cfg.max_retries,
                 )
             except asyncio.TimeoutError:
-                raise UpstreamError(504, f"no worker became ready within {self.cfg.request_timeout:.0f}s")
+                raise UpstreamError(504, f"no worker became ready within {timeout:.0f}s")
             except Exception as e:
                 # The SDK does not retry a failed /route/ call; one transient
                 # autoscaler error shouldn't fail the whole request.
-                remaining = self.cfg.request_timeout - (time.time() - t0)
+                remaining = timeout - (time.time() - t0)
                 if "route" in str(e).lower() and attempts < 3 and remaining > 10:
                     log.warning("route failed (%s), retrying", e)
                     await asyncio.sleep(2 * attempts)
@@ -197,6 +216,52 @@ class Shim:
         except Exception as e:
             out["workers_error"] = str(e)
         return web.json_response(out)
+
+    async def info_page(self, request):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "status.html"), encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/html")
+
+    async def info_json(self, request):
+        """The status page's data. The worker is asked (route /orch/info) only
+        when the autoscaler lists one as running, so viewing the page never
+        starts a GPU; otherwise the last answer is shown, with its age."""
+        if not self._authorized(request):
+            return web.json_response(_error_body(401, "unauthorized"), status=401)
+        out = {"endpoint": self.cfg.endpoint_name,
+               "models": {"chat": self.cfg.served_model_name, "embedding": self.cfg.embed_model_name or None},
+               "api_key_required": bool(self.cfg.shim_api_key), "workers": [], "live_fresh": False}
+        running = False
+        try:
+            workers = await self.client.get_endpoint_workers(await self.endpoint())
+            out["workers"] = [{"id": w.id, "status": w.status, "reqs_working": w.reqs_working} for w in workers]
+            running = any(str(w.status).lower() == "running" for w in workers)
+        except Exception as e:
+            out["workers_error"] = str(e)[:300]
+        if running:
+            async with self._info_lock:
+                if time.time() - self._info_at > 10:
+                    try:
+                        result = await self._dispatch("/orch/info", {}, False, cost=1, timeout=self.cfg.info_timeout)
+                        if not isinstance(result.get("response"), dict):
+                            raise UpstreamError(502, "worker sent no info")
+                        self._info, self._info_at = result["response"], time.time()
+                        self._save_info()
+                    except Exception as e:
+                        out["live_error"] = f"the running worker didn't answer: {str(e)[:200]}"
+                out["live_fresh"] = time.time() - self._info_at <= 15
+        out["live"], out["live_at"] = self._info, (self._info_at or None)
+        return web.json_response(out)
+
+    def _save_info(self):
+        if not self.cfg.info_cache:
+            return
+        try:
+            tmp = self.cfg.info_cache + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"info": self._info, "at": self._info_at}, f)
+            os.replace(tmp, self.cfg.info_cache)
+        except OSError as e:
+            log.warning("could not save %s: %s", self.cfg.info_cache, e)
 
     async def wake(self, request):
         if not self._authorized(request):
@@ -324,6 +389,9 @@ def make_app(shim: Shim):
     app.router.add_get("/health", shim.health)
     app.router.add_get("/v1/models", shim.models)
     app.router.add_get("/status", shim.status)
+    app.router.add_get("/", shim.info_page)
+    app.router.add_get("/info", shim.info_page)
+    app.router.add_get("/info.json", shim.info_json)
     app.router.add_post("/wake", shim.wake)
     app.router.add_post("/v1/chat/completions", lambda r: shim.generate(r, "/v1/chat/completions"))
     app.router.add_post("/v1/completions", lambda r: shim.generate(r, "/v1/completions"))

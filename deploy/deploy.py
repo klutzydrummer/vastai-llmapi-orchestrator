@@ -54,6 +54,10 @@ GH_API = "https://api.github.com"
 GH_RAW = "https://raw.githubusercontent.com"
 UA = {"User-Agent": "vastai-llmapi-orchestrator-deploy"}
 
+# The worker's GPU memory planner; `check` runs the same one before anything is rented.
+sys.path.insert(0, os.path.join(REPO_ROOT, "worker"))
+import vram  # noqa: E402
+
 
 class CheckFailed(Exception):
     pass
@@ -111,6 +115,9 @@ def docker_options(cfg, pins):
         "MMPROJ_FILE": m.get("mmproj_file", ""),
         "MMPROJ_REVISION": pins.get("mmproj_revision", ""),
         "LLAMA_CTX": l["ctx"],
+        "LLAMA_CTX_MIN": l.get("ctx_min"),
+        "LLAMA_UBATCH": l.get("ubatch"),
+        "LLAMA_IMAGE_TOKENS": l.get("image_tokens"),
         "LLAMA_PARALLEL": l["parallel"],
         "LLAMA_CACHE_TYPE": l["cache_type"],
         "LLAMA_REASONING_BUDGET": l.get("reasoning_budget", 0),
@@ -132,6 +139,8 @@ def docker_options(cfg, pins):
             "EMBED_REVISION": pins.get("embed_revision", ""),
             "EMBED_CTX": e.get("ctx", 8192),
             "EMBED_POOLING": e.get("pooling", "last"),
+            "EMBED_GPU": "1" if e.get("gpu", True) else "0",
+            "EMBED_CACHE_TYPE": e.get("cache_type", "f16"),
         })
     parts = ["-p 3000:3000"]
     for k, v in env.items():
@@ -307,6 +316,75 @@ def vast():
     return VastAI(api_key=key)
 
 
+# ── GPU memory preflight ─────────────────────────────────────────────────────
+CARD_GIB = (8, 10, 11, 12, 16, 20, 24, 32, 40, 45, 48, 80, 94, 96, 141)
+# What the driver keeps with nothing running: rental 54231885's RTX 3090
+# reported 23859 of 24576 MiB free.
+DRIVER_RESERVE_MIB = 720
+
+
+def smallest_gpu_mib(cfg):
+    """Memory of the smallest card the search can rent: the next card size at
+    or above both search_params' gpu_ram floor and llama.min_vram_gb."""
+    m = re.search(r"\bgpu_ram\s*(>=|>)\s*([0-9]*\.?[0-9]+)", cfg["workergroup"]["search_params"])
+    floor = max(float(m.group(2)) if m else 0.0, float(cfg["llama"]["min_vram_gb"]))
+    return next((g for g in CARD_GIB if g >= floor), floor) * 1024
+
+
+def plan_settings(cfg):
+    """The planner's settings from the config, as the worker reads them from its env."""
+    l, e = cfg["llama"], cfg.get("embedding") or {}
+    cache = l["cache_type"]
+    ecache = e.get("cache_type", "f16")
+    for name, val in (("llama.cache_type", cache), ("embedding.cache_type", ecache)):
+        if val not in vram.CACHE_BYTES:
+            raise CheckFailed(f"{name}={val!r} is not one of {', '.join(vram.CACHE_BYTES)}")
+    if not isinstance(e.get("gpu", True), bool):
+        raise CheckFailed("embedding.gpu must be true or false")
+    ctx_min = l.get("ctx_min", l["ctx"])
+    if not 256 * l["parallel"] <= ctx_min <= l["ctx"]:
+        raise CheckFailed(f"llama.ctx_min={ctx_min} must be between {256 * l['parallel']} (256 per slot) "
+                          f"and llama.ctx={l['ctx']}")
+    return {"ctx": l["ctx"], "ctx_min": ctx_min, "parallel": l["parallel"], "cache_type": cache,
+            "ubatch": l.get("ubatch", 512), "image_tokens": l.get("image_tokens", 1120),
+            "embed_ctx": e.get("ctx", 8192), "embed_cache": ecache, "embed_gpu": e.get("gpu", True),
+            "mmproj_offload": "--no-mmproj-offload" not in str(l.get("extra_args", "")).replace(";", " ").split()}
+
+
+def _hub_header(repo, sha, path):
+    return vram.read_header(vram.HttpSource(vram.hub_url(repo, sha, path), _hf_headers()))
+
+
+def gpu_memory_plan(cfg, files, read_header=_hub_header):
+    """Whether the models fit the smallest GPU the search allows, from their
+    headers (a few MB each, at the pinned revisions). files maps chat/mmproj/
+    embed to (repo, sha, path, size). Returns the plan; prints the breakdown."""
+    settings = plan_settings(cfg)
+    total = smallest_gpu_mib(cfg)
+    try:
+        chat = vram.model_facts(read_header(*files["chat"][:3]), files["chat"][3])
+        mm = vram.projector_facts(read_header(*files["mmproj"][:3]), files["mmproj"][3]) if files.get("mmproj") else None
+        emb = (vram.model_facts(read_header(*files["embed"][:3]), files["embed"][3])
+               if files.get("embed") and settings["embed_gpu"] else None)
+    except (vram.HeaderError, OSError) as e:
+        raise CheckFailed(f"can't read a model header: {e}")
+    p = vram.plan(total - DRIVER_RESERVE_MIB, total, chat, settings, mm, emb)
+    say(f"  info  sized for the smallest GPU the search allows: {total:.0f} MiB "
+        f"(gpu_ram/min_vram_gb), {DRIVER_RESERVE_MIB} MiB of it kept by the driver")
+    for line in vram.describe(p):
+        say(f"        {line}")
+    if not p["fits"]:
+        options = ["a larger GPU (raise gpu_ram>= in search_params and llama.min_vram_gb)",
+                   "a lower llama.ctx_min"]
+        if settings["mmproj_offload"] and mm:
+            options.append("the projector in system RAM (llama.extra_args = \"--no-mmproj-offload\"; slower images)")
+        if emb:
+            options.append("the embedding model on the CPU (embedding.gpu = false; slower embeddings)")
+        raise CheckFailed(f"models don't fit a {total:.0f} MiB GPU: {p['short_mib']} MiB short even with chat "
+                          f"context {p['ctx_min']}. Options (your call): " + "; ".join(options))
+    return p
+
+
 def check(cfg, v=None):
     """Run every preflight check; return the pins to deploy with."""
     m, l, b = cfg["model"], cfg["llama"], cfg["boot"]
@@ -330,11 +408,12 @@ def check(cfg, v=None):
 
     say("model files")
     pins["model_revision"] = step(f"{m['repo']}@{m['revision']}", lambda: hf_resolve(m["repo"], m["revision"]))
-    sizes = []
+    sizes, files = [], {}
     if pins["model_revision"]:
         sz = step(m["file"], lambda: hf_file_size(m["repo"], pins["model_revision"], m["file"]))
         if sz:
             sizes.append(sz)
+            files["chat"] = (m["repo"], pins["model_revision"], m["file"], sz)
     if m.get("mmproj_file"):
         mm_repo = m.get("mmproj_repo") or m["repo"]
         pins["mmproj_revision"] = step(f"{mm_repo}@{m.get('mmproj_revision', 'main')}",
@@ -343,6 +422,7 @@ def check(cfg, v=None):
             sz = step(m["mmproj_file"], lambda: hf_file_size(mm_repo, pins["mmproj_revision"], m["mmproj_file"]))
             if sz:
                 sizes.append(sz)
+                files["mmproj"] = (mm_repo, pins["mmproj_revision"], m["mmproj_file"], sz)
     else:
         say("  warn  no mmproj configured: image input will not work")
     e = cfg.get("embedding")
@@ -353,6 +433,7 @@ def check(cfg, v=None):
             sz = step(e["file"], lambda: hf_file_size(e["repo"], pins["embed_revision"], e["file"]))
             if sz:
                 sizes.append(sz)
+                files["embed"] = (e["repo"], pins["embed_revision"], e["file"], sz)
 
     weights_gb = sum(sizes) / 1024**3
     if sizes:
@@ -361,16 +442,19 @@ def check(cfg, v=None):
         if cfg["template"]["disk_gb"] < need_disk:
             problems.append(f"template.disk_gb={cfg['template']['disk_gb']} is too small; use >= {need_disk:.0f}")
             say("  FAIL  disk too small")
-        if weights_gb + 2.5 > l["min_vram_gb"]:
-            say(f"  warn  weights (all models) {weights_gb:.1f} GiB leave little room for KV cache under "
-                f"min_vram_gb={l['min_vram_gb']}")
+
+    say("GPU memory")
+    if "chat" in files and ("mmproj" in files or not m.get("mmproj_file")) and ("embed" in files or not e):
+        step("models, context caches and buffers fit", lambda: gpu_memory_plan(cfg, files) and None)
+    else:
+        say("  skip  a model file could not be checked (see above)")
 
     say("worker code and image")
     pins["orch_ref"] = step(f"github {b['orch_repo']}@{b['orch_ref']}", lambda: gh_resolve(b["orch_repo"], b["orch_ref"]))
     if pins["orch_ref"]:
         for f in ("worker/onstart.sh", "worker/boot.sh", "worker/fetch_model.py", "worker/hf_download.py",
                   "worker/smoke_test.py",
-                  "worker/router.py", "worker/pyworker_worker.py"):
+                  "worker/router.py", "worker/pyworker_worker.py", "worker/vram.py"):
             def _has(f=f):
                 if not gh_raw_exists(b["orch_repo"], pins["orch_ref"], f):
                     raise CheckFailed("not found at that commit (push it first)")

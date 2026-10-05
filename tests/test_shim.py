@@ -26,12 +26,16 @@ class Fake:
         self.ready_at = 0.0          # route returns no worker until this time
         self.worker_status = 200
         self.received = []
+        self.workers = []            # get_endpoint_workers answer
 
     async def route(self, request):
         body = await request.json()
         if time.time() < self.ready_at:
             return web.json_response({"request_idx": 7})
         return web.json_response({"request_idx": 7, "url": FAKE, "signature": "x", "reqnum": 1})
+
+    async def endpoint_workers(self, request):
+        return web.json_response(self.workers)
 
     async def worker(self, request):
         body = await request.json()
@@ -40,6 +44,8 @@ class Fake:
         self.received.append(payload)
         if self.worker_status != 200:
             return web.json_response({"error": {"message": "worker exploded"}}, status=self.worker_status)
+        if request.path == "/orch/info":
+            return web.json_response({"chat": {"slots": 2, "ctx_per_slot": 16384, "ctx_total": 32768}})
         if request.path == "/v1/embeddings":
             n = len(payload["input"]) if isinstance(payload["input"], list) else 1
             return web.json_response({"object": "list", "model": payload["model"], "data": [
@@ -90,6 +96,8 @@ async def main():
     app.router.add_post("/v1/chat/completions", fake.worker)
     app.router.add_post("/v1/completions", fake.worker)
     app.router.add_post("/v1/embeddings", fake.worker)
+    app.router.add_post("/orch/info", fake.worker)
+    app.router.add_post("/get_endpoint_workers/", fake.endpoint_workers)
     frunner = web.AppRunner(app)
     await frunner.setup()
     await web.TCPSite(frunner, "127.0.0.1", FAKE_PORT).start()
@@ -201,6 +209,41 @@ async def main():
     ok("/v1/embeddings reaches the worker with the embedding model's name")
     await runner.cleanup()
 
+    # status page: never wakes a GPU; asks a running worker; remembers its answer
+    cache = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"shim-info-{os.getpid()}.json")
+    s, runner = await make_shim(info_cache=cache)
+    async with ClientSession() as http:
+        async with http.get(base + "/") as r:
+            html = await r.text()
+        assert r.status == 200 and "Copy all" in html and "info.json" in html
+        n0 = len(fake.received)
+        fake.workers = []
+        async with http.get(base + "/info.json") as r:
+            d = await r.json()
+        assert d["live"] is None and not d["live_fresh"] and len(fake.received) == n0, d
+        assert d["models"] == {"chat": "waifu", "embedding": None} and d["api_key_required"] is False
+        ok("status page with no worker running asks no worker")
+        fake.workers = [{"id": 5, "status": "loading"}]
+        async with http.get(base + "/info.json") as r:
+            d = await r.json()
+        assert d["live"] is None and len(fake.received) == n0 and d["workers"][0]["status"] == "loading", d
+        fake.workers = [{"id": 5, "status": "running"}]
+        async with http.get(base + "/info.json") as r:
+            d = await r.json()
+        assert d["live_fresh"] and d["live"]["chat"]["ctx_per_slot"] == 16384, d
+        assert fake.received[-1] == {} and os.path.exists(cache)
+        ok("status page asks a running worker for slots and context")
+    await runner.cleanup()
+    s, runner = await make_shim(info_cache=cache)
+    fake.workers = []
+    async with ClientSession() as http:
+        async with http.get(base + "/info.json") as r:
+            d = await r.json()
+        assert not d["live_fresh"] and d["live"]["chat"]["slots"] == 2 and d["live_at"], d
+    ok("status page shows the last answer, with its age, once the worker is gone")
+    os.remove(cache)
+    await runner.cleanup()
+
     # auth
     s, runner = await make_shim(shim_api_key="secret")
     async with ClientSession() as http:
@@ -208,6 +251,10 @@ async def main():
             assert r.status == 401
         async with http.get(base + "/v1/models", headers={"Authorization": "Bearer secret"}) as r:
             assert r.status == 200
+        async with http.get(base + "/info.json") as r:
+            assert r.status == 401
+        async with http.get(base + "/info") as r:
+            assert r.status == 200   # the page has no data of its own; it asks for the key
     ok("SHIM_API_KEY enforced")
     await runner.cleanup()
     await frunner.cleanup()
