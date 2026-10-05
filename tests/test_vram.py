@@ -18,7 +18,7 @@ import gguf  # noqa: E402
 import vram  # noqa: E402
 
 MiB = 1024 * 1024
-CHAT_SIZE, MMPROJ_SIZE, EMBED_SIZE = 14_970_000_000, 1_194_800_000, 639_153_184
+CHAT_SIZE, MMPROJ_SIZE, EMBED_SIZE = 16018 * 1024 * 1024, 1_194_800_000, 639_153_184
 TMP = tempfile.mkdtemp(prefix="test_vram.")
 PASSED, FAILED = [], []
 
@@ -166,6 +166,31 @@ def rental_54231885_fits_with_embedding_on_gpu():
     assert p["embed_ctx"] >= 2048 and p["ctx"] >= 8192
     assert "embedding weights" in p["parts_mib"] and "projector + vision compute (est.)" in p["parts_mib"]
     assert p["need_mib"] <= 23859
+
+
+@case
+def estimates_match_rental_54245444():
+    """estimates match what rental 54245444's RTX 3090 measured, within 300 MiB over and never under"""
+    chat, mm, emb = facts("gemma4", CHAT_SIZE), facts("gemma4-mmproj", MMPROJ_SIZE), facts("qwen3-embed", EMBED_SIZE)
+    # Embedding server alone, -c 8192 with -b/-ub varied: compute buffer 0.598 MiB per batch token.
+    for ub, measured in ((8192, 4900), (4096, 2450), (2048, 1225)):
+        est = vram.compute_bytes(emb, ub, embedding=True) / MiB
+        assert measured - 5 <= est <= measured + 10, (ub, est)   # the measured figures are rounded
+    # Chat compute buffer at -ub 1120, 2 slots: 385 MiB.
+    assert 385 <= vram.compute_bytes(chat, 1120, 2) / MiB <= 450
+    # Whole set loaded, embedding at -c/-b/-ub 2048 and 4096: nvidia-smi used minus ~120 MiB idle.
+    for ectx, measured in ((2048, 21120 - 120), (4096, 22560 - 120)):
+        p = vram.plan(10**6, 24576, chat, cfg(embed_ctx=ectx), mm, emb)
+        est = p["need_mib"] - p["parts_mib"]["margin"]
+        assert measured <= est <= measured + 300, (ectx, est, measured)
+
+
+@case
+def embedding_ctx_8192_is_cut_to_fit_24gb():
+    """the old 8192 embedding context doesn't fit beside the chat model on 24 GiB; the plan halves it to 4096"""
+    p = vram.plan(23859, 24576, facts("gemma4", CHAT_SIZE), cfg(embed_ctx=8192, ctx_min=16384),
+                  facts("gemma4-mmproj", MMPROJ_SIZE), facts("qwen3-embed", EMBED_SIZE))
+    assert p["fits"] and p["embed_ctx"] == 4096 and p["ctx"] == 32768, vram.describe(p)
 
 
 @case

@@ -4,7 +4,9 @@
 Behaviour knobs (env):
   FAKE_LLAMA_MODE  ok (default) | crash (exit during load) | novision |
                    textfail | die_after_ready | oom_mmproj (CUDA out of
-                   memory loading the projector, as on rental 54231885)
+                   memory loading the projector, as on rental 54231885) |
+                   leak_thought (text replies '<|thought|>\n') | role_prefix
+                   (image replies 'user\nRed'), as on rental 54245444
   FAKE_LLAMA_LOAD_SECS  seconds of 503 before /health turns 200 (default 2)
   FAKE_EMBED_MODE  ok (default) | zero (all-zero vectors) | crash (the
                    --embedding server exits during load)
@@ -112,6 +114,10 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path == "/apply-template":
+            self._json(200, {"prompt": "<start_of_turn>user\n" + json.dumps(body.get("messages"))
+                             + "<end_of_turn>\n<start_of_turn>model\n"})
+            return
         if embedding:
             if self.path != "/v1/embeddings":
                 self._json(501, {"error": {"message": "embedding server: chat not supported"}})
@@ -134,6 +140,10 @@ class H(BaseHTTPRequestHandler):
             self._json(500, {"error": {"message": "image input is not supported"}})
             return
         text = "Red" if is_image else "pong"
+        if MODE == "leak_thought" and not is_image:
+            text = "<|thought|>\n"
+        if MODE == "role_prefix" and is_image:
+            text = "user\nRed"
         self._json(200, {"choices": [{"message": {"role": "assistant", "content": text}}]})
 
 

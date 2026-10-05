@@ -51,11 +51,12 @@ EXIT_NOFIT, EXIT_INPUT = 7, 2
 CACHE_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32,
                "q4_1": 20 / 32, "q5_0": 22 / 32, "q5_1": 24 / 32, "iq4_nl": 18 / 32}
 
-# Estimates, logged next to the real figures on every boot.
-CUDA_CTX_MIB = float(os.environ.get("VRAM_CUDA_CTX_MIB", "400"))    # per llama-server process
+# Estimates, logged next to the real figures on every boot. Calibrated on
+# rental 54245444 (RTX 3090, llama.cpp b11371, WaifuGemma4 26B-A4B + BF16
+# projector + Qwen3-Embedding-0.6B); the margin below is the safety factor.
+CUDA_CTX_MIB = float(os.environ.get("VRAM_CUDA_CTX_MIB", "300"))    # per llama-server process (measured ~300)
 MARGIN_FRAC = float(os.environ.get("VRAM_MARGIN_FRAC", "0.03"))     # of total VRAM, kept free
 MARGIN_MIB = float(os.environ.get("VRAM_MARGIN_MIB", "256"))
-COMPUTE_SAFETY = 1.2
 
 
 def log(msg):
@@ -273,21 +274,25 @@ def kv_bytes(m, ctx, n_seq, ubatch, cache_k, cache_v, swa_full=False):
     return total
 
 
-def compute_bytes(m, ubatch, embedding=False):
-    """llama.cpp's compute buffer for one batch (estimate): activations, flash-
-    attention scratch and, for a chat model, logits for the whole batch."""
-    act = ubatch * 4 * (6 * m["n_embd"] + 2 * m["n_ff"])
-    attn = ubatch * 4 * m["n_head"] * max(m["k_len"], m["v_len"]) * 2
-    # llama.cpp reserves logits for every token of a batch (f32), exactly.
-    logits = 0 if embedding else ubatch * 4 * m["n_vocab"]
-    return (act + attn) * COMPUTE_SAFETY + logits
+def compute_bytes(m, ubatch, n_seq=1, embedding=False):
+    """llama.cpp's GPU compute buffer for one batch (estimate, f32).
+
+    Measured on b11371: an embedding server reserves output rows over the
+    vocabulary for every token of the batch (Qwen3-Embedding-0.6B: 0.598 MiB
+    per batch token = n_vocab x 4 + 20 x n_embd bytes; 4900 MiB at -ub 8192),
+    while a chat server keeps logits for one row per sequence and its buffer
+    is activations (WaifuGemma4: 385 MiB at -ub 1120; this gives ~400)."""
+    if embedding:
+        return ubatch * (4 * m["n_vocab"] + 20 * m["n_embd"])
+    act = ubatch * 4 * (8 * m["n_embd"] + 4 * m["n_ff"] + 6 * m["n_head"] * max(m["k_len"], m["v_len"]))
+    return act + n_seq * 4 * m["n_vocab"]
 
 
 def projector_bytes(p, image_tokens):
-    """Projector weights plus the vision encoder's compute buffer (estimate)."""
-    patches = p["patches"] or image_tokens * 4
-    work = patches * 4 * p["hidden"] * 12 + patches * 4 * p["n_head"] * 256
-    return p["size"] * 1.02 + work * COMPUTE_SAFETY
+    """Projector weights plus the vision encoder's compute buffer (estimate).
+    Measured: the Gemma 4 BF16 projector (1139 MiB) took 1297 MiB with 1120
+    image tokens (llama.cpp's worst case); this gives ~1313."""
+    return p["size"] + image_tokens * 4 * p["hidden"] * 35
 
 
 # ── the plan ──────────────────────────────────────────────────────────────────
@@ -312,7 +317,7 @@ def plan(free_mib, total_mib, chat, cfg, mmproj=None, embed=None):
 
     fixed = {
         "chat weights": chat["size"] / MiB,
-        "chat compute (est.)": compute_bytes(chat, ub) / MiB,
+        "chat compute (est.)": compute_bytes(chat, ub, n_seq) / MiB,
         "CUDA contexts (est.)": CUDA_CTX_MIB * procs,
         "margin": margin,
     }
@@ -418,7 +423,7 @@ def config_from_env():
     return {"ctx": int(e("LLAMA_CTX", "32768")), "ctx_min": int(e("LLAMA_CTX_MIN", "0") or 0),
             "parallel": int(e("LLAMA_PARALLEL", "2")), "cache_type": e("LLAMA_CACHE_TYPE", "q8_0"),
             "ubatch": int(e("LLAMA_UBATCH", "512") or 512), "image_tokens": int(e("LLAMA_IMAGE_TOKENS", "1120") or 0),
-            "embed_ctx": int(e("EMBED_CTX", "8192")), "embed_cache": e("EMBED_CACHE_TYPE", "f16") or "f16",
+            "embed_ctx": int(e("EMBED_CTX", "4096")), "embed_cache": e("EMBED_CACHE_TYPE", "f16") or "f16",
             "embed_gpu": e("EMBED_GPU", "1").strip().lower() not in ("0", "false", "no", "off"),
             "mmproj_offload": "--no-mmproj-offload" not in e("LLAMA_EXTRA_ARGS", "").replace(";", " ").split()}
 

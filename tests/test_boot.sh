@@ -120,6 +120,10 @@ run_case "missing file on the Hub" fatal 30 MODEL_FILE=nope.gguf
 run_case "llama-server crashes during load" fatal 30 FAKE_LLAMA_MODE=crash
 run_case "vision not loaded (bad mmproj)" fatal 30 FAKE_LLAMA_MODE=novision
 run_case "text request fails" fatal 30 FAKE_LLAMA_MODE=textfail
+run_case "text reply is a leaked thinking token" fatal 30 FAKE_LLAMA_MODE=leak_thought
+check "says why and shows the rendered prompt" bash -c "grep -q \"FAIL: text request 1: chat-template markup '<|thought|>'\" '$LAST_LOG' && grep -q 'the server renders this prompt as' '$LAST_LOG'"
+run_case "image reply starts with a role name" fatal 30 FAKE_LLAMA_MODE=role_prefix
+check "says the reply starts with a role name" grep -q "FAIL: image request: reply starts with a role name" "$LAST_LOG"
 run_case "boot deadline" fatal 30 FAKE_LLAMA_LOAD_SECS=30 BOOT_DEADLINE=6
 check "deadline failure names the step it was stuck at" grep -q "not ready within 6s (still at: loading the model)" "$LAST_LOG"
 check "deadline ORCH_FATAL reaches the container console" grep -q "ORCH_FATAL: not ready within 6s" "$LAST_CONSOLE"
@@ -193,7 +197,7 @@ run_case "llama-server dies after ready" ready_then_fatal 40 FAKE_LLAMA_MODE=die
 EMB=(EMBED_REPO=test/repo EMBED_FILE=embed.gguf EMBED_SERVED_NAME=testembed)
 run_case "chat + embedding servers behind the router" ready 60 "${EMB[@]}"
 grep -q -- "--embedding --pooling last" "$LAST_LOG" && grep -q "embedding ok" "$LAST_LOG" \
-    && grep -q "text ok" "$LAST_LOG" && grep -q "image ok" "$LAST_LOG" \
+    && grep -q "text 2 ok" "$LAST_LOG" && grep -q "image ok" "$LAST_LOG" \
     && echo "PASS  chat, image and embedding requests all went through the router" && PASS=$((PASS+1)) \
     || { echo "FAIL  router path incomplete"; FAIL=$((FAIL+1)); sed 's/^/      /' "$LAST_LOG" | tail -15; }
 run_case "embedding server returns zero vectors" fatal 30 "${EMB[@]}" FAKE_EMBED_MODE=zero

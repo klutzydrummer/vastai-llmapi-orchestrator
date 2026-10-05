@@ -34,7 +34,7 @@ the autoscaler drops that worker instead of billing for it.
 | download | file exists at the **pinned commit** on the Hub; enough disk; after 90 s, the projected finish at the last minute's speed is within `download_max_s` | fatal (a download with no data for 2 minutes is restarted first) |
 | verify | size + **sha256 match the Hub's LFS hash**; GGUF magic bytes | file deleted, fatal |
 | load | the embedding server, then the chat server (sized from the memory left), stay alive and `/health` goes 200 within `load_timeout_s` | fatal, with llama-server's own error line |
-| smoke test | `/props` reports vision on; a text request and a **real image request** both return text; with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
+| smoke test | `/props` reports vision on; two text requests and a **real image request** return clean text (no leaked chat-template markup like `<\|thought\|>`, no reply starting with a role name; the rendered prompt is logged if one does); with an embedding model, `/v1/embeddings` returns finite, non-zero vectors | fatal |
 | deadline | the boot, not counting the download, finishes within `deadline_s` | fatal, naming the step it was stuck at |
 | serving | `llama-server` exits later | fatal |
 | after fatal | no PyWorker left to report it, `ORCH_FATAL_GRACE` (600 s) later | instance destroys itself (manual rental: stops) |
@@ -338,9 +338,14 @@ reads the GGUF headers of the chat model, projector and embedding model from
 the Hub (a few MB each, by HTTP range request) and adds up, per server: the
 weights, the context cache (per layer, so Gemma's sliding-window layers and
 per-layer KV heads count correctly; older headers use the plain formula), the
-compute buffer (llama.cpp reserves logits for a whole batch), the projector
-and its vision encoder, a CUDA context per process and a margin
-(256 MiB + 3% of the card). If that's more than the GPU's free memory it
+compute buffer, the projector and its vision encoder, a CUDA context per
+process (~300 MiB) and a margin (256 MiB + 3% of the card). The buffer and
+overhead figures are calibrated on an RTX 3090 (rental 54245444), where the
+whole WaifuGemma4 + projector + Qwen3 embedding set came within ~90 MiB of
+`nvidia-smi`. The embedding server's buffer is the big one: about 0.6 MiB per
+token of `embedding.ctx` (its batch size equals its context), so the default
+4096 costs ~2.4 GiB and 8192 ~4.8 GiB, which doesn't fit beside the chat model
+on 24 GB. If that's more than the GPU's free memory it
 gives up, in order: embedding context (halved down to 2048), embedding cache
 precision (f16 to q8_0), then chat context (down to `llama.ctx_min`). If even
 that doesn't fit, the boot fails before downloading and says by how much.

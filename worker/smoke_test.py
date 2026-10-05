@@ -4,9 +4,14 @@
 Runs against the local llama-server (default http://127.0.0.1:18000):
   1. /props  — when the server reports modalities, vision must be on if an
                mmproj was configured (catches a projector that silently failed).
-  2. text    — a short chat completion must return non-empty text.
+  2. text    — two short chat completions must each return clean text: not
+               empty, no chat-template markup (<|...|>, <start_of_turn>, ...)
+               and not starting with a role name, which is what a template or
+               thinking-mode mismatch leaks into replies (rental 54245444:
+               '<|thought|>\n', 'user\n...'). On such a reply the prompt as
+               the server renders it (/apply-template) is logged.
   3. image   — a chat completion with an inline PNG must succeed and return
-               text. The image is a solid red square; if the answer doesn't
+               clean text. The image is a solid red square; if the answer doesn't
                mention red that is logged as a warning, or treated as a failure
                with SMOKE_IMAGE_STRICT=1.
   4. embedding — when EMBED_SERVED_NAME is set, /v1/embeddings must return
@@ -19,6 +24,7 @@ import base64
 import json
 import math
 import os
+import re
 import struct
 import sys
 import time
@@ -65,11 +71,39 @@ def call(path, body=None):
 
 
 def reply_text(resp):
+    """The reply's content. Reasoning (reasoning_content) doesn't count: with
+    reasoning_budget 0 the answer must be in the content."""
     try:
-        msg = resp["choices"][0]["message"]
-    except (KeyError, IndexError, TypeError):
+        return resp["choices"][0]["message"].get("content") or ""
+    except (KeyError, IndexError, TypeError, AttributeError):
         return ""
-    return ((msg.get("content") or "") + " " + (msg.get("reasoning_content") or "")).strip()
+
+
+# Chat-template markup that must never reach a client: <|...|> tokens,
+# Gemma's <start_of_turn>/<end_of_turn>, <|channel>-style openers, think tags.
+MARKUP = re.compile(r"<\|[^<>\s]{0,40}\|?>|<(start|end)_of_turn>|</?(think|thought)>", re.I)
+ROLE_PREFIX = re.compile(r"^\s*(user|model|assistant|system)\s*(\n|:)", re.I)
+
+
+def garbled(text):
+    """Why a reply looks like leaked template or thinking output, or ""."""
+    if not text.strip():
+        return "empty reply"
+    m = MARKUP.search(text)
+    if m:
+        return f"chat-template markup {m.group(0)!r} in the reply"
+    if ROLE_PREFIX.match(text):
+        return "reply starts with a role name"
+    if not re.search(r"[^\W_]", text):
+        return "no words in the reply"
+    return ""
+
+
+def show_template(messages):
+    """Log the prompt as the server renders it, to diagnose a garbled reply."""
+    status, resp = call("/apply-template", {"messages": messages})
+    if status == 200 and isinstance(resp.get("prompt"), str):
+        log(f"the server renders this prompt as: {resp['prompt'][-400:]!r}")
 
 
 def check_props():
@@ -86,16 +120,24 @@ def check_props():
 
 
 def check_text():
-    t0 = time.time()
-    status, resp = call("/v1/chat/completions", {
-        "model": MODEL, "temperature": 0, "max_tokens": 24,
-        "messages": [{"role": "user", "content": "Reply with the single word: pong"}],
-    })
-    text = reply_text(resp)
-    if status != 200 or not text:
-        log(f"FAIL: text request -> HTTP {status}: {resp.get('_error') or str(resp)[:300]}")
-        return False
-    log(f"text ok in {time.time() - t0:.1f}s: {text[:80]!r}")
+    messages = [{"role": "user", "content": "Reply with the single word: pong"}]
+    # Twice: rental 54245444's first reply leaked a thinking token, later ones didn't.
+    for n in (1, 2):
+        t0 = time.time()
+        status, resp = call("/v1/chat/completions", {
+            "model": MODEL, "temperature": 0, "max_tokens": 24, "messages": messages})
+        if status != 200:
+            log(f"FAIL: text request -> HTTP {status}: {resp.get('_error') or str(resp)[:300]}")
+            return False
+        text = reply_text(resp)
+        why = garbled(text)
+        if why:
+            log(f"FAIL: text request {n}: {why}: {text[:200]!r}")
+            show_template(messages)
+            return False
+        if "pong" not in text.lower():
+            log(f"warning: text reply {n} did not say pong: {text[:80]!r}")
+        log(f"text {n} ok in {time.time() - t0:.1f}s: {text[:80]!r}")
     return True
 
 
@@ -109,9 +151,13 @@ def check_image():
             {"type": "text", "text": "What single color fills this image? Answer with one word."},
         ]}],
     })
-    text = reply_text(resp)
-    if status != 200 or not text:
+    if status != 200:
         log(f"FAIL: image request -> HTTP {status}: {resp.get('_error') or str(resp)[:300]}")
+        return False
+    text = reply_text(resp)
+    why = garbled(text)
+    if why:
+        log(f"FAIL: image request: {why}: {text[:200]!r}")
         return False
     if "red" not in text.lower():
         if STRICT_IMAGE:
