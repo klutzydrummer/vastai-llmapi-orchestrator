@@ -200,13 +200,25 @@ def check_limits(cfg):
         val = cfg[section].get(key)
         if not isinstance(val, int) or isinstance(val, bool) or val < 0:
             raise CheckFailed(f"{section}.{key} must be set to a whole number (Vast's default is much higher)")
-    parse_warm_hours(e.get("warm_hours", ""))
-    if e.get("warm_tz"):
+    if "warm_tz" in e:
+        raise CheckFailed("endpoint.warm_tz is now endpoint.schedule_tz (it covers warm_hours and cold_hours)")
+    scheduled = [k for k in ("warm_hours", "cold_hours") if parse_hours(e.get(k, ""), k)]
+    if scheduled and not e.get("schedule_tz"):
+        raise CheckFailed(f"endpoint.{scheduled[0]} needs endpoint.schedule_tz, your IANA time zone "
+                          "(e.g. \"America/Chicago\"); the container's clock is UTC")
+    if e.get("schedule_tz"):
         try:
-            ZoneInfo(e["warm_tz"])
+            ZoneInfo(e["schedule_tz"])
         except Exception:
-            raise CheckFailed(f"endpoint.warm_tz: unknown time zone {e['warm_tz']!r} "
+            raise CheckFailed(f"endpoint.schedule_tz: unknown time zone {e['schedule_tz']!r} "
                               "(use an IANA name like \"America/Chicago\")")
+    if "cold_hours" in scheduled:
+        if e["cold_workers"] != 0:
+            raise CheckFailed("endpoint.cold_hours needs endpoint.cold_workers = 0 (the value outside "
+                              "cold_hours); the number kept during them is cold_hours_workers")
+        chw = e.get("cold_hours_workers", 1)
+        if not isinstance(chw, int) or isinstance(chw, bool) or not 1 <= chw <= e["max_workers"]:
+            raise CheckFailed("endpoint.cold_hours_workers must be a whole number from 1 to max_workers")
     wml = e.get("warm_min_load", 1)
     if isinstance(wml, bool) or not isinstance(wml, (int, float)) or wml <= 0:
         raise CheckFailed("endpoint.warm_min_load must be a number above 0")
@@ -722,15 +734,36 @@ def verify_workergroup(v, wg_id, want):
     return _verify(next((r for r in rows if r.get("id") == wg_id), None), want, f"workergroup {wg_id}")
 
 
-def parse_warm_hours(text):
-    """"15:00-23:00" or "06:30-08:00,15:00-23:00" -> [(start_min, end_min), ...].
-    A range may cross midnight ("22:00-02:00"). Empty -> [] (off)."""
+DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+WEEK_MIN = 7 * 1440
+
+
+def _parse_days(text, key, part):
+    """"Mon-Fri", "Sat-Sun", "Fri-Mon" (wraps), "Sun" -> [0..6] (Monday = 0)."""
+    ends = [d.strip().lower() for d in text.split("-")]
+    if len(ends) > 2 or any(d[:3] not in DAYS or not DAYS[DAYS.index(d[:3])].startswith(d[:3]) or
+                            len(d) < 3 for d in ends):
+        raise CheckFailed(f"endpoint.{key}: can't read the days in {part!r}; use Mon..Sun, e.g. \"Mon-Fri\"")
+    a, b = DAYS.index(ends[0][:3]), DAYS.index(ends[-1][:3])
+    return [(a + i) % 7 for i in range((b - a) % 7 + 1)]
+
+
+def parse_hours(text, key="warm_hours"):
+    """"15:00-23:00" (every day) or "Mon-Fri 14:00-24:00, Sat-Sun 08:00-24:00"
+    -> [(start, length), ...] in minutes of the week from Monday 00:00. A
+    range may cross midnight ("Fri 22:00-02:00" runs into Saturday); its days
+    are the days it starts on. Empty -> [] (off)."""
     out = []
     for part in (p.strip() for p in (text or "").split(",")):
         if not part:
             continue
+        words = part.split()
+        bad = f"endpoint.{key}: can't read {part!r}; use \"[Mon-Fri ]HH:MM-HH:MM\", comma-separated"
+        if len(words) > 2:
+            raise CheckFailed(bad)
+        days = _parse_days(words[0], key, part) if len(words) == 2 else list(range(7))
         try:
-            a, b = part.split("-")
+            a, b = words[-1].split("-")
             mins = []
             for t in (a, b):
                 h, m = (int(x) for x in t.strip().split(":"))
@@ -738,37 +771,48 @@ def parse_warm_hours(text):
                     raise ValueError
                 mins.append(h * 60 + m)
         except ValueError:
-            raise CheckFailed(f"endpoint.warm_hours: can't read {part!r}; use \"HH:MM-HH:MM\", comma-separated")
-        if mins[0] == mins[1]:
-            raise CheckFailed(f"endpoint.warm_hours: {part!r} is empty")
-        out.append((mins[0], mins[1]))
+            raise CheckFailed(bad)
+        if mins[0] % 1440 == mins[1] % 1440:
+            raise CheckFailed(f"endpoint.{key}: {part!r} is empty")
+        out += [(d * 1440 + mins[0], (mins[1] - mins[0]) % 1440) for d in days]
     return out
 
 
-def warm_now(cfg, now=None):
-    """Whether endpoint.warm_hours covers `now` (epoch seconds), in
-    endpoint.warm_tz (the machine's clock when unset)."""
+def in_hours(cfg, key, now=None):
+    """Whether endpoint.<key> covers `now` (epoch seconds) in endpoint.schedule_tz."""
     e = cfg["endpoint"]
-    windows = parse_warm_hours(e.get("warm_hours", ""))
+    windows = parse_hours(e.get(key, ""), key)
     if not windows:
         return False
-    tz = ZoneInfo(e["warm_tz"]) if e.get("warm_tz") else None
-    t = datetime.fromtimestamp(time.time() if now is None else now, tz)
-    m = t.hour * 60 + t.minute
-    return any((a <= m < b) if a < b else (m >= a or m < b) for a, b in windows)
+    t = datetime.fromtimestamp(time.time() if now is None else now, ZoneInfo(e["schedule_tz"]))
+    m = t.weekday() * 1440 + t.hour * 60 + t.minute
+    return any((m - s) % WEEK_MIN < length for s, length in windows)
 
 
-def endpoint_limits(cfg, now=None):
+def warm_now(cfg, now=None):
+    return in_hours(cfg, "warm_hours", now)
+
+
+def cold_now(cfg, now=None):
+    return in_hours(cfg, "cold_hours", now)
+
+
+def endpoint_limits(cfg, now=None, st=None):
     """The endpoint settings to send now. During endpoint.warm_hours,
     min_load is endpoint.warm_min_load: the autoscaler then keeps a worker
     running with no traffic, instead of releasing it after
-    inactivity_timeout. Every write (apply, pause, resume, watch) goes
-    through here, so none of them undoes the other."""
+    inactivity_timeout. During endpoint.cold_hours, once watch has seen a
+    worker (st["cold_held"]), cold_workers is endpoint.cold_hours_workers,
+    so an idle worker is stopped with its weights instead of destroyed.
+    Every write (apply, pause, resume, watch) goes through here, so none of
+    them undoes the other."""
     e = cfg["endpoint"]
     out = {k: e[k] for k in ("max_workers", "cold_workers", "min_load", "target_util",
                              "cold_mult", "inactivity_timeout") if k in e}
     if warm_now(cfg, now):
         out["min_load"] = e.get("warm_min_load", 1)
+    if (st or {}).get("cold_held") and cold_now(cfg, now):
+        out["cold_workers"] = e.get("cold_hours_workers", 1)
     return out
 
 
@@ -1004,7 +1048,7 @@ def _apply(v, cfg, pins, opts):
     save_state(st)
     say(f"template {tpl_hash} ({t['name']})")
 
-    ep_fields = endpoint_limits(cfg)
+    ep_fields = endpoint_limits(cfg, st=st)
     if ep:
         v.update_endpoint(ep["id"], endpoint_name=e["name"], **ep_fields)
         say(f"endpoint {ep['id']} updated")
@@ -1341,12 +1385,12 @@ def cmd_logs(cfg, args):
     say(json.dumps(out, indent=2) if not isinstance(out, str) else out)
 
 
-def set_endpoint_state(v, cfg, ep, state):
+def set_endpoint_state(v, cfg, ep, state, st=None):
     # Send every configured limit with the new state, so nothing depends on
     # how Vast treats fields an update leaves out, then read it back.
-    v.update_endpoint(ep["id"], endpoint_name=cfg["endpoint"]["name"], endpoint_state=state,
-                      **endpoint_limits(cfg))
-    verify_endpoint(v, ep["id"], {"endpoint_state": state, **endpoint_limits(cfg)})
+    want = endpoint_limits(cfg, st=load_state() if st is None else st)
+    v.update_endpoint(ep["id"], endpoint_name=cfg["endpoint"]["name"], endpoint_state=state, **want)
+    verify_endpoint(v, ep["id"], {"endpoint_state": state, **want})
     say(f"endpoint {ep['id']} -> {state}")
 
 
@@ -1658,7 +1702,7 @@ def watch_tick(v, cfg, st, now=None):
     if burn > budget + 1e-9:
         msg = f"account burn ${burn:.3f}/hr is over limits.max_hourly_usd={budget:.2f}"
         if ep and cfg["limits"].get("on_breach", "pause") == "pause" and ep.get("endpoint_state") != "stopped":
-            set_endpoint_state(v, cfg, ep, "stopped")
+            set_endpoint_state(v, cfg, ep, "stopped", st)
             actions.append(msg + "; endpoint paused (resume with `deploy.py resume`)")
         else:
             actions.append(msg + "; alert only")
