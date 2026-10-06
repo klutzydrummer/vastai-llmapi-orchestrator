@@ -1,5 +1,6 @@
 # Watchdog for the Vast deployment: destroys workers Vast reports stuck
-# booting and recorded orphans, pauses the endpoint on overspend.
+# booting and recorded orphans, pauses the endpoint on overspend, and applies
+# the warm_hours / cold_hours schedules (they only change while this runs).
 # Copy to /etc/systemd/system/, adjust paths, then:
 #   systemctl enable --now orch-watch
 [Unit]
