@@ -150,10 +150,11 @@ function render(d) {
 
   const st = $("state");
   if (d.live_fresh) {
-    st.innerHTML = '<span class="pill ok">live</span> from the running worker, ' + ago(d.live_at);
+    st.innerHTML = '<span class="pill ok">running</span> a worker is up; values from its answer after a request, ' +
+      ago(d.live_at) + ". This page never asks the worker itself, so leaving it open doesn't keep a GPU billing";
   } else if (d.live) {
     st.innerHTML = '<span class="pill warn">last seen</span> ' + ago(d.live_at) +
-      "; no worker answered just now, so these are the values from the last boot it saw";
+      "; no worker is running, so these are the values from the last one";
   } else {
     st.innerHTML = '<span class="pill warn">no worker yet</span> context and slots appear once a worker has run';
   }

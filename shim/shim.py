@@ -17,10 +17,20 @@ Endpoints:
   GET  /, /info                                status page for people: URL, model,
                                                slots, context per slot, with copy
                                                buttons (shim/status.html)
-  GET  /info.json                              what that page shows; asks a worker
-                                               only when one is running, so it
-                                               never starts a GPU
+  GET  /info.json                              what that page shows, from the
+                                               worker's last answer; never asks
+                                               a worker itself
   GET  /health                                 the shim itself
+
+Release rule (README, "When a worker is released"): a worker is kept while
+client work is in flight and for inactivity_timeout after it, and only client
+work counts. Client work is a chat, completion or embedding request, streamed
+or not, or POST /wake; each goes through Vast's router with a cost from
+request_cost(), the same numbers the worker reports as load. Nothing else the
+shim answers (/v1/models, /status, the status page, /health) sends anything
+to a worker, so leaving the status page open never keeps a GPU billing. The
+worker's /orch/info is asked only right after client work succeeded, while a
+worker is listed as running (_refresh_info).
 
 Configuration is by environment variable; see config.example.env.
 """
@@ -41,6 +51,25 @@ def _env_bool(name, default):
     return os.environ.get(name, str(int(default))).strip().lower() in ("1", "true", "yes", "on")
 
 
+DEFAULT_COST = 512   # a generation request that names no limit; = worker DEFAULT_WORKLOAD
+
+
+def request_cost(body, default=DEFAULT_COST):
+    """Load of one client request, in tokens: the routing cost sent to Vast.
+    Same rule as request_workload() in worker/pyworker_worker.py (a test
+    keeps them equal): embeddings about 4 characters per input token,
+    generations the token limit they name, else `default`; never below 1."""
+    if "input" in body and "messages" not in body and "prompt" not in body:
+        inp = body["input"]
+        items = inp if isinstance(inp, list) else [inp]
+        return max(1, int(sum(len(x) if isinstance(x, str) else len(str(x)) for x in items) / 4))
+    for k in ("max_tokens", "max_completion_tokens", "n_predict"):
+        v = body.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 1:
+            return int(v)
+    return max(1, int(default))
+
+
 @dataclass
 class Config:
     vast_api_key: str
@@ -53,12 +82,13 @@ class Config:
     request_timeout: float = 1800.0   # max wait for a worker, cold start included
     worker_timeout: float = 900.0     # max time a non-streaming generation may take
     keepalive_interval: float = 10.0
-    default_cost: int = 512
+    default_cost: int = DEFAULT_COST
     nonstream_keepalive: bool = True
     fast_fail_window: float = 1.5
     max_retries: int = 3              # worker 5xx/429 retries before giving up
     info_cache: str = ""              # last worker info, kept across restarts; "" = memory only
-    info_timeout: float = 20.0        # how long the status page waits on a running worker
+    info_timeout: float = 20.0        # how long an /orch/info refresh waits on the running worker
+    info_min_interval: float = 30.0   # at most one /orch/info refresh per this many seconds
 
     @classmethod
     def from_env(cls):
@@ -77,12 +107,13 @@ class Config:
             request_timeout=float(os.environ.get("REQUEST_TIMEOUT", "1800")),
             worker_timeout=float(os.environ.get("WORKER_TIMEOUT", "900")),
             keepalive_interval=float(os.environ.get("KEEPALIVE_INTERVAL", "10")),
-            default_cost=int(os.environ.get("DEFAULT_COST", "512")),
+            default_cost=int(os.environ.get("DEFAULT_COST", str(DEFAULT_COST))),
             nonstream_keepalive=_env_bool("NONSTREAM_KEEPALIVE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "3")),
             info_cache=os.environ.get("INFO_CACHE", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                    ".info-cache.json")),
             info_timeout=float(os.environ.get("INFO_TIMEOUT", "20")),
+            info_min_interval=float(os.environ.get("INFO_MIN_INTERVAL", "30")),
         )
 
 
@@ -105,6 +136,7 @@ class Shim:
         self._endpoint_lock = asyncio.Lock()
         self.stats = {"requests": 0, "errors": 0, "last_wait_s": None, "last_ok_at": None}
         self._info, self._info_at, self._info_lock = None, 0.0, asyncio.Lock()
+        self._info_tried, self._info_error = 0.0, None
         try:
             with open(cfg.info_cache) as f:
                 saved = json.load(f)
@@ -145,16 +177,7 @@ class Shim:
         return request.headers.get("Authorization", "") == f"Bearer {self.cfg.shim_api_key}"
 
     def _cost(self, body):
-        if "input" in body and "messages" not in body and "prompt" not in body:
-            # Embeddings: about 4 characters per token, as the worker counts it.
-            inp = body["input"]
-            items = inp if isinstance(inp, list) else [inp]
-            return max(1, int(sum(len(x) if isinstance(x, str) else len(str(x)) for x in items) / 4))
-        for k in ("max_tokens", "max_completion_tokens", "n_predict"):
-            v = body.get(k)
-            if isinstance(v, (int, float)) and v > 0:
-                return int(v)
-        return self.cfg.default_cost
+        return request_cost(body, self.cfg.default_cost)
 
     async def _dispatch(self, route, body, stream, cost=None, timeout=None):
         """Route to a worker and return the SDK result dict; raise UpstreamError."""
@@ -222,9 +245,11 @@ class Shim:
             return web.Response(text=f.read(), content_type="text/html")
 
     async def info_json(self, request):
-        """The status page's data. The worker is asked (route /orch/info) only
-        when the autoscaler lists one as running, so viewing the page never
-        starts a GPU; otherwise the last answer is shown, with its age."""
+        """The status page's data: the worker's last /orch/info answer and its
+        age, plus the autoscaler's worker list. Never sends anything to a
+        worker: a request here would count as activity and keep a GPU up for
+        as long as the page stays open. The answer is refreshed after client
+        work instead (_refresh_info)."""
         if not self._authorized(request):
             return web.json_response(_error_body(401, "unauthorized"), status=401)
         out = {"endpoint": self.cfg.endpoint_name,
@@ -237,20 +262,37 @@ class Shim:
             running = any(str(w.status).lower() == "running" for w in workers)
         except Exception as e:
             out["workers_error"] = str(e)[:300]
-        if running:
-            async with self._info_lock:
-                if time.time() - self._info_at > 10:
-                    try:
-                        result = await self._dispatch("/orch/info", {}, False, cost=1, timeout=self.cfg.info_timeout)
-                        if not isinstance(result.get("response"), dict):
-                            raise UpstreamError(502, "worker sent no info")
-                        self._info, self._info_at = result["response"], time.time()
-                        self._save_info()
-                    except Exception as e:
-                        out["live_error"] = f"the running worker didn't answer: {str(e)[:200]}"
-                out["live_fresh"] = time.time() - self._info_at <= 15
+        out["live_fresh"] = running and self._info is not None
+        if self._info_error:
+            out["live_error"] = self._info_error
         out["live"], out["live_at"] = self._info, (self._info_at or None)
         return web.json_response(out)
+
+    def _after_work(self):
+        """Client work just succeeded, so a worker is up and the endpoint is
+        active anyway: refresh the status page's worker info in the
+        background, at most once per info_min_interval."""
+        if time.time() - self._info_tried < self.cfg.info_min_interval or self._info_lock.locked():
+            return
+        self._info_tried = time.time()
+        self._info_task = asyncio.create_task(self._refresh_info())   # held so it isn't collected
+
+    async def _refresh_info(self):
+        async with self._info_lock:
+            try:
+                # Only a worker the autoscaler lists as running: a routed
+                # request with none running would start one.
+                workers = await self.client.get_endpoint_workers(await self.endpoint())
+                if not any(str(w.status).lower() == "running" for w in workers):
+                    return
+                result = await self._dispatch("/orch/info", {}, False, cost=1, timeout=self.cfg.info_timeout)
+                if not isinstance(result.get("response"), dict):
+                    raise UpstreamError(502, "worker sent no info")
+                self._info, self._info_at, self._info_error = result["response"], time.time(), None
+                self._save_info()
+            except Exception as e:
+                self._info_error = f"the running worker didn't answer: {str(e)[:200]}"
+                log.warning("worker info refresh failed: %s", e)
 
     def _save_info(self):
         if not self.cfg.info_cache:
@@ -279,6 +321,7 @@ class Shim:
             try:
                 await self._dispatch(route, body, False)
                 log.info("wake: a worker is ready")
+                self._after_work()
             except Exception as e:
                 log.warning("wake failed: %s", e)
 
@@ -319,6 +362,7 @@ class Shim:
             except Exception as e:
                 return self._error_response(e)
             self._ok(t0)
+            self._after_work()
             return web.json_response(result["response"])
 
         resp = web.StreamResponse(status=200, headers={
@@ -347,6 +391,7 @@ class Shim:
             else:
                 await resp.write(json.dumps(result["response"]).encode())
             self._ok(t0, wait_s)
+            self._after_work()
             await resp.write_eof()
         except (ConnectionResetError, asyncio.CancelledError):
             log.info("client went away; cancelling request")

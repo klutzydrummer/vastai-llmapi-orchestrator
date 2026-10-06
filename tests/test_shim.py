@@ -11,6 +11,8 @@ import time
 from aiohttp import ClientSession, web
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shim"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
+import pyworker_worker  # noqa: E402
 import shim as shim_mod  # noqa: E402
 from vastai import CoroutineServerless  # noqa: E402
 from vastai.serverless.client.endpoint import Endpoint  # noqa: E402
@@ -26,10 +28,13 @@ class Fake:
         self.ready_at = 0.0          # route returns no worker until this time
         self.worker_status = 200
         self.received = []
+        self.costs = []              # cost of every /route/ call
+        self.paths = []              # path of every request the worker got
         self.workers = []            # get_endpoint_workers answer
 
     async def route(self, request):
         body = await request.json()
+        self.costs.append(body.get("cost"))
         if time.time() < self.ready_at:
             return web.json_response({"request_idx": 7})
         return web.json_response({"request_idx": 7, "url": FAKE, "signature": "x", "reqnum": 1})
@@ -42,6 +47,7 @@ class Fake:
         assert "auth_data" in body and "payload" in body, body
         payload = body["payload"]
         self.received.append(payload)
+        self.paths.append(request.path)
         if self.worker_status != 200:
             return web.json_response({"error": {"message": "worker exploded"}}, status=self.worker_status)
         if request.path == "/orch/info":
@@ -209,30 +215,87 @@ async def main():
     ok("/v1/embeddings reaches the worker with the embedding model's name")
     await runner.cleanup()
 
-    # status page: never wakes a GPU; asks a running worker; remembers its answer
+    # Release rule: every kind of client work goes through the router with a
+    # cost above zero, and the worker reports the same number as load.
+    table = [
+        {"input": "x" * 400}, {"input": ["ab", "cd", "e" * 4000]}, {"input": ""}, {"input": [1, 2]},
+        {"messages": [{"role": "user", "content": "hi"}]},                     # no limit named
+        {"messages": [], "max_tokens": 300}, {"messages": [], "max_tokens": 0},
+        {"messages": [], "max_tokens": -1}, {"messages": [], "max_tokens": True},
+        {"messages": [], "max_completion_tokens": 77}, {"prompt": "hi", "n_predict": 9},
+        {"prompt": "hi", "max_tokens": "200"}, {"prompt": "hi", "max_tokens": 0.5},
+    ]
+    for body in table:
+        w, c = pyworker_worker.request_workload(body), shim_mod.request_cost(body)
+        assert w >= 1 and c >= 1 and int(w) == c, (body, w, c)
+    assert shim_mod.request_cost({"messages": []}) == pyworker_worker.DEFAULT_WORKLOAD == shim_mod.DEFAULT_COST
+    assert pyworker_worker.request_workload({"messages": [], "max_tokens": 64}) == 64
+    ok("shim routing cost and worker load agree, and are never zero")
+
+    s, runner = await make_shim(embed_model_name="qwen3-embed")
+    async with ClientSession() as http:
+        fake.costs.clear()
+        fake.paths.clear()
+        async with http.post(base + "/v1/embeddings", json={"input": "a short query"}) as r:
+            await r.read()
+        async with http.post(base + "/v1/chat/completions", json={
+                "stream": True, "messages": [{"role": "user", "content": "hi"}]}) as r:
+            await r.read()
+        async with http.post(base + "/v1/completions", json={"prompt": "hi"}) as r:
+            await r.read()
+        assert fake.paths == ["/v1/embeddings", "/v1/chat/completions", "/v1/completions"], fake.paths
+        assert fake.costs == [3, 512, 512], fake.costs
+    ok("embedding, chat and completion requests all reach Vast's router with a load")
+    await runner.cleanup()
+
+    # status page: never sends anything to a worker; values come from the
+    # worker right after client work, while one is listed as running
     cache = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"shim-info-{os.getpid()}.json")
-    s, runner = await make_shim(info_cache=cache)
+    s, runner = await make_shim(info_cache=cache, info_min_interval=0.2)
     async with ClientSession() as http:
         async with http.get(base + "/") as r:
             html = await r.text()
         assert r.status == 200 and "Copy all" in html and "info.json" in html
-        n0 = len(fake.received)
         fake.workers = []
+        fake.costs.clear()
+        fake.paths.clear()
         async with http.get(base + "/info.json") as r:
             d = await r.json()
-        assert d["live"] is None and not d["live_fresh"] and len(fake.received) == n0, d
+        assert d["live"] is None and not d["live_fresh"] and not fake.costs, d
         assert d["models"] == {"chat": "waifu", "embedding": None} and d["api_key_required"] is False
         ok("status page with no worker running asks no worker")
-        fake.workers = [{"id": 5, "status": "loading"}]
-        async with http.get(base + "/info.json") as r:
-            d = await r.json()
-        assert d["live"] is None and len(fake.received) == n0 and d["workers"][0]["status"] == "loading", d
         fake.workers = [{"id": 5, "status": "running"}]
+        for _ in range(5):
+            async with http.get(base + "/info.json") as r:
+                d = await r.json()
+        assert not fake.costs and d["live"] is None and d["workers"][0]["status"] == "running", (fake.costs, d)
+        ok("status page never sends a request to a running worker (it would count as activity)")
+        async with http.post(base + "/v1/chat/completions", json={"messages": [], "max_tokens": 5}) as r:
+            await r.read()
+        for _ in range(30):
+            if "/orch/info" in fake.paths:
+                break
+            await asyncio.sleep(0.1)
+        assert fake.paths == ["/v1/chat/completions", "/orch/info"] and fake.costs == [5, 1], (fake.paths, fake.costs)
+        for _ in range(30):
+            if s._info is not None:
+                break
+            await asyncio.sleep(0.05)
         async with http.get(base + "/info.json") as r:
             d = await r.json()
-        assert d["live_fresh"] and d["live"]["chat"]["ctx_per_slot"] == 16384, d
-        assert fake.received[-1] == {} and os.path.exists(cache)
-        ok("status page asks a running worker for slots and context")
+        assert d["live_fresh"] and d["live"]["chat"]["ctx_per_slot"] == 16384 and os.path.exists(cache), d
+        ok("worker info is refreshed right after client work")
+        # A finished request while no worker is listed running: no info
+        # request, since a routed one would start a worker.
+        fake.workers = []
+        fake.costs.clear()
+        fake.paths.clear()
+        await asyncio.sleep(0.3)
+        async with http.post(base + "/v1/chat/completions", json={"messages": [], "max_tokens": 5}) as r:
+            await r.read()
+        await asyncio.sleep(0.5)
+        assert fake.paths == ["/v1/chat/completions"] and len(fake.costs) == 1, (fake.paths, fake.costs)
+        ok("info refresh skipped when no worker is listed running")
     await runner.cleanup()
     s, runner = await make_shim(info_cache=cache)
     fake.workers = []

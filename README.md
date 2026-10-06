@@ -357,11 +357,46 @@ states.
 asks for, each with a Copy button: the API URL, model ids, whether a key is
 needed, context per slot (SillyTavern's Context Size), slots, total and
 trained context, image support, the embedding model's input limit and
-dimensions, and the worker's GPU and memory plan. It asks the worker only
-when the autoscaler lists one as running, so opening the page never starts a
-GPU; otherwise it shows the last answer and how old it is (kept in
-`shim/.info-cache.json` across restarts, `INFO_CACHE` to move it). With
-`SHIM_API_KEY` set the page asks for the key once and keeps it in the browser.
+dimensions, and the worker's GPU and memory plan. The page itself never
+sends anything to a worker, so opening it never starts a GPU and leaving it
+open never keeps one billing (see **When a worker is released**). The values
+come from the worker right after a chat, embedding or wake request succeeds
+(at most every 30 s, `INFO_MIN_INTERVAL`), and the page shows how old they
+are (kept in `shim/.info-cache.json` across restarts, `INFO_CACHE` to move
+it). With `SHIM_API_KEY` set the page asks for the key once and keeps it in
+the browser.
+
+**When a worker is released.** Vast's autoscaler releases a running worker
+once the endpoint has seen no activity for `endpoint.inactivity_timeout`
+(900 s in the examples) and `min_load` allows zero workers. The rule this
+repo holds every path to:
+
+- *Keeps a worker:* any client work, while it runs and for
+  `inactivity_timeout` after it ends. Client work is a chat or completion
+  request, an embedding request, or `POST /wake`. A streamed reply counts
+  until its last chunk; a request the client abandons ends when it is
+  cancelled.
+- *Never keeps a worker:* anything else: `/v1/models`, `/status`, the status
+  page, `/health`, the watchdog's and `deploy.py`'s API polls, and the
+  PyWorker's own health checks.
+- *Deliberate exception:* `warm_hours`, which holds a worker with no traffic
+  by raising `min_load` (below), not by sending requests.
+
+How the code matches it: every client request goes through Vast's router and
+the worker's PyWorker, the only activity the autoscaler can see. Embeddings
+are a PyWorker route like chat, not a side channel. Each request is reported
+with a load above zero, from one rule that the shim (`request_cost`, the
+routing cost) and the worker (`request_workload`, the load it reports) share,
+and a test keeps the two equal: embeddings count about 4 input characters
+per token, generations their `max_tokens` / `max_completion_tokens` /
+`n_predict`, else 512. The stock llama worker counted a chat request without
+`max_tokens` as zero load; this one doesn't. The PyWorker keeps a request in
+its working set until the response is fully sent, so a long stream reports
+load the whole time. The shim's only other worker request, `/orch/info` for
+the status page, is sent only right after client work succeeded and only
+while a worker is listed as running, so it never extends idle time by more
+than that one request. What Vast's autoscaler counts as "activity" internally
+isn't documented; the code relies only on requests routed to workers.
 
 **Warm hours.** Set `endpoint.warm_hours` (for example `"14:30-23:00"`) and
 `endpoint.warm_tz` (for example `"America/Chicago"`; the machine's clock,
