@@ -54,10 +54,10 @@ target_util        = 0.9
 cold_mult          = 1.0
 inactivity_timeout = 1800    # seconds idle (30 min) before workers are released; verify in the dashboard
 schedule_tz        = "America/Chicago"   # IANA zone for warm_hours and cold_hours; set yours
-cold_hours         = "Mon-Fri 14:00-24:00, Sat-Sun 08:00-24:00"
-                             # once a request has started a worker, keep it stopped with weights on
-                             # disk when idle (no re-download); outside these hours none is kept and
-                             # watch removes stopped workers. "" = off
+cold_hours         = ""      # e.g. "Mon-Fri 14:00-24:00, Sat-Sun 08:00-24:00": once a request has
+                             # started a worker, keep it stopped with weights on disk when idle.
+                             # Off: on a live endpoint Vast rented extra workers to fill it, and the
+                             # stopped worker's host can give its GPU away (README, Schedules). "" = off
 cold_hours_workers = 1       # cold_workers during cold_hours (cold_workers above stays 0)
 warm_hours         = ""      # e.g. "Mon-Fri 15:00-23:00": watch keeps a worker running then; "" = off
 warm_min_load      = 1       # min_load during warm_hours; above 0 asks the autoscaler to keep a worker up

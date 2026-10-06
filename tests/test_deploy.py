@@ -28,8 +28,8 @@ with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.exampl
     BASE_CFG = tomllib.load(f)
 # The example's schedule is tested on its own (schedule tests below); the
 # rest of the suite runs unscheduled, so the clock doesn't change what it sees.
-EXAMPLE_COLD_HOURS = BASE_CFG["endpoint"]["cold_hours"]
-BASE_CFG["endpoint"]["cold_hours"] = ""
+assert BASE_CFG["endpoint"]["cold_hours"] == "", "the examples leave cold_hours off (README, Schedules)"
+EXAMPLE_COLD_HOURS = "Mon-Fri 14:00-24:00, Sat-Sun 08:00-24:00"
 NAME = BASE_CFG["endpoint"]["name"]
 PINS = {"model_revision": "a" * 40, "orch_ref": "b" * 40, "mmproj_revision": "c" * 40, "embed_revision": "d" * 40}
 
@@ -958,6 +958,71 @@ def cold_hours_keep_a_worker_only_after_one_started():
     st = deploy.load_state()
     deploy.watch_tick(v, plain, st, at(1, 15))
     assert "cold_held" not in st and v.endpoints[0]["cold_workers"] == 0
+
+
+@case
+def cold_hours_drop_an_unavail_worker():
+    """cold hours: a kept worker Vast reports unavail stops the hold (cold_workers 0 first) and is destroyed"""
+    cfg = cold_cfg()
+    v = FakeVast()
+    deploy._apply(v, cfg, PINS, "-p 3000:3000")
+    def wtick(now):
+        st = deploy.load_state()
+        out = deploy.watch_tick(v, cfg, st, now)
+        deploy.save_state(st)
+        return out
+    v.instances, v.workers = [inst(1)], {1: "IDLE"}
+    wtick(at(0, 15))
+    assert v.endpoints[0]["cold_workers"] == 1
+    v.instances, v.workers = [inst(1, status="stopped")], {1: "STOPPED"}
+    v.calls.clear()
+    assert not wtick(at(0, 16)) and not v.made("destroy_instance")
+    for row_status, inst_fields in (("unavail", {}), ("STOPPED", {"cur_state": "unavail"}),
+                                    ("STOPPED", {"actual_status": "unavailable"})):
+        v.instances = [dict(inst(1, status="stopped"), **inst_fields)]
+        v.workers = {1: row_status}
+        v.endpoints[0]["cold_workers"] = 1
+        st = deploy.load_state()
+        st["cold_held"] = True
+        deploy.save_state(st)
+        v.calls.clear()
+        acts = wtick(at(0, 17))
+        updates = [i for i, c in enumerate(v.calls) if c[0] == "update_endpoint"]
+        destroys = [i for i, c in enumerate(v.calls) if c[0] == "destroy_instance"]
+        assert v.endpoints[0]["cold_workers"] == 0 and updates and destroys, (row_status, acts, v.calls)
+        assert updates[0] < destroys[0], v.calls   # floor lowered before the worker goes
+        assert any("unavail" in a for a in acts), acts
+        v.instances, v.workers = [inst(1, status="stopped")], {1: "STOPPED"}
+    # a plain stopped worker in cold hours is still kept
+    v.instances, v.workers = [inst(2)], {2: "IDLE"}
+    wtick(at(0, 18))
+    v.instances, v.workers = [inst(2, status="stopped")], {2: "STOPPED"}
+    v.calls.clear()
+    wtick(at(0, 19))
+    assert not v.made("destroy_instance") and v.endpoints[0]["cold_workers"] == 1
+
+
+@case
+def stopped_instances_show_their_storage_rate():
+    """status: a stopped instance bills storage (storage_cost x disk_space), not its running dph_total"""
+    run = inst(1, dph=0.485)
+    stopped = dict(inst(2, status="exited", dph=0.485), storage_cost=0.15, disk_space=48)
+    unknown = inst(3, status="stopped", dph=0.485)
+    assert deploy._rate(run) == 0.485
+    assert abs(deploy._rate(stopped) - 0.01) < 1e-9
+    assert deploy._rate(unknown) is None
+    assert "storage $0.010/hr" in deploy._describe(stopped) and "0.485" not in deploy._describe(stopped)
+    assert "storage rate not reported" in deploy._describe(unknown)
+    lines = []
+    real = deploy.say
+    deploy.say = lines.append
+    try:
+        deploy._report({"workers": [run, stopped, unknown], "manual": [], "orphans": [], "young": [],
+                        "unattributed": [], "why": {}})
+    finally:
+        deploy.say = real
+    assert "this deployment: 3 instance(s), $0.495/hr" in lines, lines
+    assert any("plus storage Vast didn't report" in x for x in lines), lines
 
 
 # ── GPU memory preflight ─────────────────────────────────────────────────────

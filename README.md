@@ -345,11 +345,10 @@ For vector storage / RAG, point the embedding source at the same base URL
 (OpenAI-compatible); the model is `embedding.served_name` (`EMBED_MODEL_NAME`
 in `shim/.env`). An embedding request wakes a worker like any other.
 
-The first message after an idle period waits for a worker. Outside
-`cold_hours` (see **Schedules**) the example configs keep no stopped workers,
+The first message after an idle period waits for a worker. The example
+configs keep no stopped workers (`cold_hours` is off, see **Schedules**),
 so a start downloads the weights (about 29 GB for the default config, 17 GB
-for WaifuGemma4) on a fresh machine; inside them, a worker that already ran
-that day resumes without downloading. See **Downloads and cold starts** below for the trade-off. Streaming
+for WaifuGemma4) on a fresh machine. See **Downloads and cold starts** below for the trade-off. Streaming
 shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
@@ -412,8 +411,8 @@ applies them about once a minute, so it has to be running (`docker compose up
 -d` starts it); `apply`, `pause` and `resume` send the values for the current
 time, so none of them undoes a schedule. `deploy.py status` prints both.
 
-- **`cold_hours`** (on in the examples: weekdays 2 PM to midnight, weekends 8
-  AM to midnight). Outside them nothing is kept: `cold_workers` is 0, so a
+- **`cold_hours`** (off in the examples; e.g. `"Mon-Fri 14:00-24:00, Sat-Sun
+  08:00-24:00"`, see *What a live test showed* below). Outside them nothing is kept: `cold_workers` is 0, so a
   worker a request starts is destroyed once idle, and `watch` destroys any
   stopped worker it finds. Inside them nothing is started ahead of a request
   either; once a request has started a worker, `watch` raises the endpoint's
@@ -437,12 +436,29 @@ time, so none of them undoes a schedule. `deploy.py status` prints both.
   hours).
 
 Each change is read back, and a value Vast reports differently is put back.
-Not yet confirmed on a live endpoint: whether Vast's autoscaler goes by the
-endpoint's `cold_workers` or the copy the workergroup was created with (always
-the outside-hours value, 0; Vast's API can't change it afterwards), and
-whether it lists stopped workers as the endpoint's workers. If either goes the
-other way, an idle worker in `cold_hours` is destroyed rather than kept, which
-costs a download, not money while idle.
+
+*What a live test showed* (endpoint 39473, 2026-10-05, no requests sent):
+Vast does go by the endpoint's `cold_workers`, does list a stopped worker as
+the endpoint's, and did stop an idle worker with its weights instead of
+destroying it. But two things make the saving unreliable, which is why the
+examples leave `cold_hours` off:
+
+- Right after `cold_workers` went to 1 (with one idle worker running, and a
+  template change rolling out at the same time), Vast rented and dropped six
+  extra workers over 15 minutes (A100, RTX 5090, RTX 5000 Ada), each for a
+  minute or two, up to two billing at once, despite `max_workers = 1`. It
+  stopped once the running worker was recycled and stopped. Vast documents
+  `cold_workers` as a floor on total workers that the autoscaler fills, so
+  it can rent to meet it; which of the two changes set this off isn't known.
+- A stopped worker holds no GPU. 14 minutes after it stopped, its host rented
+  the GPU to someone else and Vast reported it `unavail`: it can't resume
+  until that rental ends, so the next request would have downloaded anyway.
+  `watch` now sets `cold_workers` back to 0 as soon as the kept worker is
+  `unavail` (so Vast has no floor to refill) and destroys it.
+
+`deploy.py status` shows a stopped instance at its storage rate
+(`storage_cost` x `disk_space`, about $0.01/hr in that test), not its running
+`dph_total`.
 
 ## GPU memory
 
@@ -529,7 +545,7 @@ own limits instead of eating the boot deadline:
 - A download that receives nothing for 2 minutes is restarted.
 
 Every cold start downloads everything again. To skip that, set
-`endpoint.cold_hours` (see **Schedules**; the examples do) or, around the clock,
+`endpoint.cold_hours` (see **Schedules**, including why the examples don't) or, around the clock,
 `endpoint.cold_workers = 1`: one stopped worker keeps its verified weights on
 disk and resumes without downloading. A stopped worker still pays Vast's
 storage rate for its disk (`template.disk_gb`), and the worker it keeps is on
