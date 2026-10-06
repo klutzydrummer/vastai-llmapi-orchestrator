@@ -369,7 +369,7 @@ the browser.
 
 **When a worker is released.** Vast's autoscaler releases a running worker
 once the endpoint has seen no activity for `endpoint.inactivity_timeout`
-(900 s in the examples) and `min_load` allows zero workers. The rule this
+(1800 s, 30 minutes, in the examples) and `min_load` allows zero workers. The rule this
 repo holds every path to:
 
 - *Keeps a worker:* any client work, while it runs and for
