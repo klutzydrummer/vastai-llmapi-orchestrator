@@ -26,6 +26,10 @@ deploy.say = lambda msg="": None
 
 with open(os.path.join(os.path.dirname(__file__), "..", "deploy", "config.example.toml"), "rb") as f:
     BASE_CFG = tomllib.load(f)
+# The example's schedule is tested on its own (schedule tests below); the
+# rest of the suite runs unscheduled, so the clock doesn't change what it sees.
+EXAMPLE_COLD_HOURS = BASE_CFG["endpoint"]["cold_hours"]
+BASE_CFG["endpoint"]["cold_hours"] = ""
 NAME = BASE_CFG["endpoint"]["name"]
 PINS = {"model_revision": "a" * 40, "orch_ref": "b" * 40, "mmproj_revision": "c" * 40, "embed_revision": "d" * 40}
 
@@ -799,7 +803,7 @@ def watch_destroys_worker_stuck_booting():
 
 def warm_cfg(**endpoint):
     cfg = copy.deepcopy(BASE_CFG)
-    cfg["endpoint"].update({"warm_hours": "15:00-23:00", "warm_tz": "UTC", **endpoint})
+    cfg["endpoint"].update({"warm_hours": "15:00-23:00", "schedule_tz": "UTC", **endpoint})
     return cfg
 
 
@@ -849,9 +853,111 @@ def warm_hours_settings_are_checked():
     """bad warm_hours, warm_tz or warm_min_load are refused before anything runs"""
     raises(lambda: deploy.check_limits(warm_cfg(warm_hours="3pm-11pm")), deploy.CheckFailed, "warm_hours")
     raises(lambda: deploy.check_limits(warm_cfg(warm_hours="15:00-15:00")), deploy.CheckFailed, "empty")
-    raises(lambda: deploy.check_limits(warm_cfg(warm_tz="Mars/Olympus")), deploy.CheckFailed, "warm_tz")
+    raises(lambda: deploy.check_limits(warm_cfg(schedule_tz="Mars/Olympus")), deploy.CheckFailed, "schedule_tz")
+    raises(lambda: deploy.check_limits(warm_cfg(schedule_tz="")), deploy.CheckFailed, "needs endpoint.schedule_tz")
+    raises(lambda: deploy.check_limits(warm_cfg(warm_tz="UTC")), deploy.CheckFailed, "now endpoint.schedule_tz")
     raises(lambda: deploy.check_limits(warm_cfg(warm_min_load=0)), deploy.CheckFailed, "warm_min_load")
     deploy.check_limits(warm_cfg())
+
+
+def at(day, h, m=0):
+    """UTC epoch seconds on the week of Monday 2026-10-05; day 0 = Monday."""
+    import datetime as dt
+    return dt.datetime(2026, 10, 5 + day, h % 24, m, tzinfo=dt.timezone.utc).timestamp() + (h // 24) * 86400
+
+
+def cold_cfg(**endpoint):
+    cfg = copy.deepcopy(BASE_CFG)
+    cfg["endpoint"].update({"cold_hours": EXAMPLE_COLD_HOURS, "schedule_tz": "UTC", **endpoint})
+    return cfg
+
+
+@case
+def schedules_take_days_of_the_week():
+    """warm_hours/cold_hours: day ranges (also wrapping ones), every-day ranges, ranges past midnight"""
+    c = cold_cfg()
+    assert EXAMPLE_COLD_HOURS == "Mon-Fri 14:00-24:00, Sat-Sun 08:00-24:00"
+    for day, h, m, want in [(0, 13, 59, False), (0, 14, 0, True), (0, 23, 59, True), (1, 0, 0, False),
+                            (4, 23, 59, True), (5, 0, 0, False), (5, 7, 59, False), (5, 8, 0, True),
+                            (6, 23, 59, True), (7, 0, 1, False), (2, 6, 30, False)]:
+        assert deploy.cold_now(c, at(day, h, m)) is want, (day, h, m, want)
+    w = warm_cfg(warm_hours="Fri-Mon 22:00-02:00")
+    assert deploy.warm_now(w, at(0, 23)) and deploy.warm_now(w, at(1, 1, 59)) and not deploy.warm_now(w, at(1, 22))
+    assert deploy.warm_now(w, at(4, 22)) and deploy.warm_now(w, at(6, 1)) and not deploy.warm_now(w, at(3, 23))
+    every = warm_cfg(warm_hours="sat 10:00-12:00, 18:00-19:00")
+    assert deploy.warm_now(every, at(2, 18, 30)) and deploy.warm_now(every, at(5, 11)) and not deploy.warm_now(every, at(2, 11))
+    # the zone counts: 14:00 in Chicago is 19:00 UTC in October
+    assert deploy.cold_now(cold_cfg(schedule_tz="America/Chicago"), at(0, 19))
+    assert not deploy.cold_now(cold_cfg(schedule_tz="America/Chicago"), at(0, 18, 59))
+
+
+@case
+def schedule_settings_are_checked():
+    """bad day names, cold_hours with cold_workers above 0, or a bad cold_hours_workers are refused"""
+    for bad in ("Mon-Fry 14:00-24:00", "Mon-Wed-Fri 14:00-15:00", "Mon Tue 14:00-15:00", "Mo 14:00-15:00"):
+        raises(lambda: deploy.check_limits(cold_cfg(cold_hours=bad)), deploy.CheckFailed, "cold_hours")
+    raises(lambda: deploy.check_limits(cold_cfg(cold_workers=1)), deploy.CheckFailed, "cold_workers = 0")
+    for n in (0, 2, True, 1.0):
+        raises(lambda: deploy.check_limits(cold_cfg(cold_hours_workers=n)), deploy.CheckFailed, "cold_hours_workers")
+    raises(lambda: deploy.check_limits(cold_cfg(schedule_tz="")), deploy.CheckFailed, "needs endpoint.schedule_tz")
+    deploy.check_limits(cold_cfg())
+    # the shipped examples pass as they are
+    for name in ("config.example.toml", "config.waifugemma4.example.toml"):
+        with open(os.path.join(os.path.dirname(__file__), "..", "deploy", name), "rb") as f:
+            deploy.check_limits(tomllib.load(f))
+
+
+@case
+def cold_hours_keep_a_worker_only_after_one_started():
+    """cold hours: cold_workers goes to 1 only once a worker exists, back to 0 after; stopped workers are removed outside them"""
+    cfg = cold_cfg()
+    v = FakeVast()
+    deploy._apply(v, cfg, PINS, "-p 3000:3000")
+    assert v.endpoints[0]["cold_workers"] == 0
+    v.calls.clear()
+    def wtick(now):
+        st = deploy.load_state()
+        out = deploy.watch_tick(v, cfg, st, now)
+        deploy.save_state(st)
+        return out
+    # in cold hours with no worker: nothing for the autoscaler to rent ahead of a request
+    wtick(at(0, 14, 5))
+    assert v.endpoints[0]["cold_workers"] == 0
+    v.calls.clear()
+    assert not wtick(at(0, 14, 6)) and not v.made("update_endpoint")
+    # a request started a worker: keep it when it idles
+    v.instances, v.workers = [inst(1)], {1: "IDLE"}
+    acts = wtick(at(0, 15))
+    assert v.endpoints[0]["cold_workers"] == 1 and "cold hours holding" in acts[0], acts
+    # apply/pause/resume while holding send the held value, so they don't undo it
+    st = deploy.load_state()
+    assert deploy.endpoint_limits(cfg, at(0, 16), st)["cold_workers"] == 1
+    assert deploy.endpoint_limits(cfg, at(1, 0), st)["cold_workers"] == 0
+    assert deploy.endpoint_limits(cfg, at(0, 16))["cold_workers"] == 0
+    # it went cold: kept during cold hours
+    v.instances = [inst(1, status="stopped")]
+    v.workers = {1: "STOPPED"}
+    v.calls.clear()
+    assert not wtick(at(0, 20)) and not v.made("destroy_instance")
+    # someone changed it behind our back: put back
+    v.endpoints[0]["cold_workers"] = 0
+    wtick(at(0, 21))
+    assert v.endpoints[0]["cold_workers"] == 1
+    # midnight: cold_workers back to 0, and the stopped worker is removed
+    v.calls.clear()
+    acts = wtick(at(1, 0))
+    assert v.endpoints[0]["cold_workers"] == 0, acts
+    assert [c[1] for c in v.made("destroy_instance")] == [1], (acts, v.calls)
+    # a running worker outside cold hours is left to idle out
+    v.instances, v.workers = [inst(2)], {2: "IDLE"}
+    v.calls.clear()
+    wtick(at(1, 9))
+    assert not v.made("destroy_instance") and v.endpoints[0]["cold_workers"] == 0
+    # removing cold_hours from the config reverts and forgets
+    plain = copy.deepcopy(BASE_CFG)
+    st = deploy.load_state()
+    deploy.watch_tick(v, plain, st, at(1, 15))
+    assert "cold_held" not in st and v.endpoints[0]["cold_workers"] == 0
 
 
 # ── GPU memory preflight ─────────────────────────────────────────────────────

@@ -345,10 +345,11 @@ For vector storage / RAG, point the embedding source at the same base URL
 (OpenAI-compatible); the model is `embedding.served_name` (`EMBED_MODEL_NAME`
 in `shim/.env`). An embedding request wakes a worker like any other.
 
-The first message after an idle period waits for a worker. The example configs
-keep no stopped workers (`cold_workers = 0`), so every start downloads the
-weights (about 29 GB for the default config, 17 GB for WaifuGemma4) on a fresh
-machine; see **Downloads and cold starts** below for the trade-off. Streaming
+The first message after an idle period waits for a worker. Outside
+`cold_hours` (see **Schedules**) the example configs keep no stopped workers,
+so a start downloads the weights (about 29 GB for the default config, 17 GB
+for WaifuGemma4) on a fresh machine; inside them, a worker that already ran
+that day resumes without downloading. See **Downloads and cold starts** below for the trade-off. Streaming
 shows nothing until the worker is up, then flows normally.
 `POST /wake` starts a worker ahead of time, and `GET /status` shows worker
 states.
@@ -380,7 +381,7 @@ repo holds every path to:
   page, `/health`, the watchdog's and `deploy.py`'s API polls, and the
   PyWorker's own health checks.
 - *Deliberate exception:* `warm_hours`, which holds a worker with no traffic
-  by raising `min_load` (below), not by sending requests.
+  by raising `min_load` (see **Schedules** below), not by sending requests.
 
 How the code matches it: every client request goes through Vast's router and
 the worker's PyWorker, the only activity the autoscaler can see. Embeddings
@@ -398,19 +399,48 @@ while a worker is listed as running, so it never extends idle time by more
 than that one request. What Vast's autoscaler counts as "activity" internally
 isn't documented; the code relies only on requests routed to workers.
 
-**Warm hours.** Set `endpoint.warm_hours` (for example `"14:30-23:00"`) and
-`endpoint.warm_tz` (for example `"America/Chicago"`; the machine's clock,
-usually UTC in Docker, when unset) and `watch` keeps one worker running during
-those hours. At the start of the window it raises the endpoint's `min_load` to
-`warm_min_load` (1), so the autoscaler holds a worker up with no traffic
-instead of releasing it after `inactivity_timeout`; at the end it puts
-`min_load` back, and the worker idles out as usual. Each change is read back,
-and `apply`, `pause` and `resume` send the value for the current time, so none
-of them undoes it. No requests are sent, so llama.cpp's prompt cache is left
-alone. Start the window about 25 minutes before you need it, since the first
-worker pays the cold start. While warm, a worker bills its full rate (a 3090
-at about $0.17/hr is about $1.40 for 8 hours). Off by default; `orch status`
-shows the workers.
+**Schedules.** Two optional endpoint settings change what is kept by time of
+day and day of week, in `endpoint.schedule_tz` (an IANA zone such as
+`"America/Chicago"`; required when either is set, since the container's clock
+is UTC). Both take comma-separated ranges, each optionally prefixed with days:
+`"Mon-Fri 14:00-24:00, Sat-Sun 08:00-24:00"`. Days are `Mon`..`Sun` or a
+range (`Fri-Mon` wraps); a range without days applies every day, and one that
+crosses midnight (`"Fri 22:00-02:00"`) belongs to the day it starts. `watch`
+applies them about once a minute, so it has to be running (`docker compose up
+-d` starts it); `apply`, `pause` and `resume` send the values for the current
+time, so none of them undoes a schedule. `deploy.py status` prints both.
+
+- **`cold_hours`** (on in the examples: weekdays 2 PM to midnight, weekends 8
+  AM to midnight). Outside them nothing is kept: `cold_workers` is 0, so a
+  worker a request starts is destroyed once idle, and `watch` destroys any
+  stopped worker it finds. Inside them nothing is started ahead of a request
+  either; once a request has started a worker, `watch` raises the endpoint's
+  `cold_workers` to `cold_hours_workers` (1), so when that worker idles out
+  Vast stops it with its weights on disk instead of destroying it, and the
+  next request resumes it without downloading. A stopped worker pays only
+  Vast's storage rate. At the end of the window `cold_workers` goes back to 0:
+  a worker still serving requests keeps running and idles out as usual, and a
+  stopped one is destroyed. `cold_workers` is raised only once a worker
+  exists because Vast describes `cold_workers` as a floor on total workers,
+  which could otherwise make it rent one with no request. `endpoint.cold_workers`
+  must be 0 when `cold_hours` is set.
+- **`warm_hours`** (off in the examples) keeps one worker *running*. At the
+  start of the window `watch` raises the endpoint's `min_load` to
+  `warm_min_load` (1), so the autoscaler holds a worker up with no traffic
+  instead of releasing it after `inactivity_timeout`; at the end it puts
+  `min_load` back, and the worker idles out as usual. No requests are sent, so
+  llama.cpp's prompt cache is left alone. Start the window about 25 minutes
+  before you need it, since the first worker pays the cold start. While warm,
+  a worker bills its full rate (a 3090 at about $0.17/hr is about $1.40 for 8
+  hours).
+
+Each change is read back, and a value Vast reports differently is put back.
+Not yet confirmed on a live endpoint: whether Vast's autoscaler goes by the
+endpoint's `cold_workers` or the copy the workergroup was created with (always
+the outside-hours value, 0; Vast's API can't change it afterwards), and
+whether it lists stopped workers as the endpoint's workers. If either goes the
+other way, an idle worker in `cold_hours` is destroyed rather than kept, which
+costs a download, not money while idle.
 
 ## GPU memory
 
@@ -497,6 +527,7 @@ own limits instead of eating the boot deadline:
 - A download that receives nothing for 2 minutes is restarted.
 
 Every cold start downloads everything again. To skip that, set
+`endpoint.cold_hours` (see **Schedules**; the examples do) or, around the clock,
 `endpoint.cold_workers = 1`: one stopped worker keeps its verified weights on
 disk and resumes without downloading. A stopped worker still pays Vast's
 storage rate for its disk (`template.disk_gb`), and the worker it keeps is on

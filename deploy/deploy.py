@@ -19,7 +19,8 @@
   deploy.py rent-test rent one instance outside serverless to prove a config,
                       and record its id
   deploy.py watch     watchdog loop: destroy workers Vast reports stuck booting
-                      and recorded orphans, pause the endpoint on overspend
+                      and recorded orphans, pause the endpoint on overspend,
+                      apply endpoint.warm_hours and endpoint.cold_hours
 
 Only facts Vast reports drive these: the autoscaler's worker list and the
 instance ids Vast returned, recorded in deploy/state.json. Every create or
@@ -1148,6 +1149,11 @@ def cmd_status(cfg, args):
         for g in find_workergroups(v, ep["id"]):
             say(json.dumps({k: g.get(k) for k in ("id", "template_hash", "search_params", "gpu_ram",
                                                   "test_workers", "cold_workers")}, indent=2))
+        e = cfg["endpoint"]
+        if e.get("warm_hours") or e.get("cold_hours"):
+            say(f"schedule ({e['schedule_tz']}): warm hours {'on' if warm_now(cfg) else 'off'} "
+                f"[{e.get('warm_hours') or 'unset'}], cold hours {'on' if cold_now(cfg) else 'off'} "
+                f"[{e.get('cold_hours') or 'unset'}]; watch applies them")
     try:
         with StateLock():
             st = load_state()
@@ -1678,21 +1684,46 @@ def watch_tick(v, cfg, st, now=None):
             st["seen_workers"].pop(str(i), None)
             st["manual_instances"].pop(str(i), None)
 
-    # 3. Warm hours: hold min_load up during them so the autoscaler keeps a
-    #    worker running, and put it back after. Written on each change of
-    #    window, or when Vast reports a value we didn't set, and read back.
-    configured = bool(cfg["endpoint"].get("warm_hours"))
-    if ep and (configured or "warm_active" in st):
+    # 3. Schedules. warm_hours: hold min_load up so the autoscaler keeps a
+    #    worker running, and put it back after. cold_hours: once a worker
+    #    exists (a request started it), raise cold_workers so that worker is
+    #    stopped with its weights when idle instead of destroyed; never
+    #    before, so the autoscaler has no reason to rent one ahead of a
+    #    request. Written on each change, or when Vast reports a value we
+    #    didn't set, and read back.
+    e = cfg["endpoint"]
+    configured = bool(e.get("warm_hours") or e.get("cold_hours"))
+    if ep and (configured or "warm_active" in st or "cold_held" in st):
         active = warm_now(cfg, now)
-        want = endpoint_limits(cfg, now)
-        reported = ep.get("min_load")
-        if st.get("warm_active") != active or (reported is not None and not _same(reported, want["min_load"])):
-            v.update_endpoint(ep["id"], endpoint_name=cfg["endpoint"]["name"], **want)
+        held = cold_now(cfg, now) and bool(r["worker_rows"])
+        prev = (st.get("warm_active"), st.get("cold_held"))
+        st["cold_held"] = held
+        want = endpoint_limits(cfg, now, st)
+        drift = [k for k in ("min_load", "cold_workers")
+                 if ep.get(k) is not None and not _same(ep.get(k), want[k])]
+        if prev != (active, held) or drift:
+            v.update_endpoint(ep["id"], endpoint_name=e["name"], **want)
             verify_endpoint(v, ep["id"], want)
             st["warm_active"] = active
-            actions.append(f"warm hours {'on' if active else 'off'}: endpoint min_load={want['min_load']}")
-        if not configured:   # warm_hours removed from the config: reverted above, now forget it
+            actions.append(f"schedule: warm hours {'on' if active else 'off'}, cold hours "
+                           f"{'holding' if held else 'off'}: endpoint min_load={want['min_load']} "
+                           f"cold_workers={want['cold_workers']}")
+        if not configured:   # schedules removed from the config: reverted above, now forget them
             st.pop("warm_active", None)
+            st.pop("cold_held", None)
+        # Outside cold_hours nothing should be kept stopped: cold_workers is
+        # 0 (just read back), so a stopped worker still listed is billing
+        # storage for nothing. Running workers are left to idle out.
+        if e.get("cold_hours") and not held:
+            cold = [i for i in r["workers"] if _status(i).lower() in ("stopped", "exited")
+                    and i.get("id") not in targets]
+            for i in cold:
+                actions.append(f"destroy stopped worker outside cold_hours {_describe(i)}")
+            if cold:
+                destroy_and_wait(v, [i.get("id") for i in cold])
+                for i in cold:
+                    st["seen_workers"].pop(str(i.get("id")), None)
+                    targets.add(i.get("id"))
 
     # 4. Whole-account spend, from Vast's own dph_total, against the budget.
     budget = float(cfg["limits"]["max_hourly_usd"])
