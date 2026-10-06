@@ -449,6 +449,11 @@ def check(cfg, v=None, facts=None):
     say("spend limits")
     step("max workers, test workers, price ceiling",
          lambda: f"worst case ${check_limits(cfg):.2f}/hr")
+    if parse_hours(cfg["endpoint"].get("cold_hours", ""), "cold_hours"):
+        say("  warn  cold_hours is on. On a live endpoint, raising cold_workers was followed by Vast renting and "
+            "dropping six extra workers in 15 minutes despite max_workers = 1, and the kept worker's host "
+            "gave its GPU away 14 minutes after it stopped, so it could not resume. See README, "
+            "Schedules")
 
     say("model files")
     pins["model_revision"] = step(f"{m['repo']}@{m['revision']}", lambda: hf_resolve(m["repo"], m["revision"]))
@@ -835,6 +840,44 @@ def _dph(inst):
         return 0.0
 
 
+# Vast's word for a stopped instance whose host has given its GPU to someone
+# else: it can't be resumed until that rental ends, and it still bills storage.
+UNAVAIL = {"unavail", "unavailable"}
+
+
+def unavailable(inst, row=None):
+    """Whether Vast reports this instance (or its autoscaler row) as unavail."""
+    return any(str(x or "").lower() in UNAVAIL
+               for x in ((inst or {}).get("actual_status"), (inst or {}).get("cur_state"), (row or {}).get("status")))
+
+
+def _stopped(inst):
+    return _status(inst).lower() in ("stopped", "exited") or unavailable(inst)
+
+
+def _rate(inst):
+    """What an instance bills per hour now, or None when Vast didn't say.
+    Running: dph_total. Stopped: storage only, from storage_cost ($/GB/month)
+    x disk_space (GB); dph_total is the running price and doesn't apply."""
+    if not _stopped(inst):
+        return _dph(inst)
+    try:
+        return float(inst["storage_cost"]) * float(inst["disk_space"]) / (30 * 24)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _rate_text(inst):
+    r = _rate(inst)
+    if not _stopped(inst):
+        return f"${r:.3f}/hr"
+    return "storage " + (f"${r:.3f}/hr" if r is not None else "rate not reported")
+
+
+def _sum_rates(insts):
+    return sum(_rate(i) or 0 for i in insts)
+
+
 def _status(inst):
     return str(inst.get("actual_status") or inst.get("cur_state") or "?")
 
@@ -846,7 +889,7 @@ def _status_msg(inst):
 def _describe(inst, note=""):
     msg = _status_msg(inst)
     return (f"instance {inst.get('id')}: {_status(inst)}, {inst.get('gpu_name', '?')}, "
-            f"${_dph(inst):.3f}/hr" + (f", label {inst['label']!r}" if inst.get("label") else "")
+            f"{_rate_text(inst)}" + (f", label {inst['label']!r}" if inst.get("label") else "")
             + (f", Vast says {msg!r}" if msg else "") + (f" ({note})" if note else ""))
 
 
@@ -1126,13 +1169,14 @@ def _report(r):
             for i in r[key]:
                 say(f"  {_describe(i, r.get('why', {}).get(i.get('id'), ''))}")
     mine = r["workers"] + r["manual"] + r["orphans"] + r["young"]
-    say(f"this deployment: {len(mine)} instance(s), ${sum(_dph(i) for i in mine):.3f}/hr")
+    say(f"this deployment: {len(mine)} instance(s), ${_sum_rates(mine):.3f}/hr")
     if r["unattributed"]:
         say("instances this tool has no record of (left alone; `sweep --destroy ID` to remove one):")
         for i in r["unattributed"]:
             say(f"  {_describe(i)}")
-    total = sum(_dph(i) for i in mine + r["unattributed"])
-    say(f"whole account: ${total:.3f}/hr")
+    total = _sum_rates(mine + r["unattributed"])
+    say(f"whole account: ${total:.3f}/hr" + (" (plus storage Vast didn't report)" if any(
+        _rate(i) is None for i in mine + r["unattributed"]) else ""))
     if r["orphans"]:
         say("run `deploy.py sweep` to destroy the orphans")
 
@@ -1194,7 +1238,7 @@ def cmd_sweep(cfg, args):
             return
         for i in targets:
             say(f"  will destroy {_describe(i)}")
-        cost = sum(_dph(i) for i in targets)
+        cost = _sum_rates(targets)
         if not confirm(f"destroy {len(targets)} instance(s) (${cost:.3f}/hr)?", args.yes):
             return
         destroy_and_wait(v, [i["id"] for i in targets])
@@ -1689,13 +1733,20 @@ def watch_tick(v, cfg, st, now=None):
     #    exists (a request started it), raise cold_workers so that worker is
     #    stopped with its weights when idle instead of destroyed; never
     #    before, so the autoscaler has no reason to rent one ahead of a
-    #    request. Written on each change, or when Vast reports a value we
-    #    didn't set, and read back.
+    #    request. A worker Vast reports unavail (its host gave the GPU to
+    #    someone else) can't resume, so it doesn't count: cold_workers goes
+    #    back to 0 first, so Vast doesn't rent a replacement, and it is
+    #    destroyed below. Written on each change, or when Vast reports a
+    #    value we didn't set, and read back.
     e = cfg["endpoint"]
     configured = bool(e.get("warm_hours") or e.get("cold_hours"))
+    by_id = {i.get("id"): i for i in r["workers"]}
+    dead = [by_id.get(w.get("id")) or {"id": w.get("id")} for w in r["worker_rows"]
+            if unavailable(by_id.get(w.get("id")), w) and w.get("id") not in targets]
+    usable = [w for w in r["worker_rows"] if w.get("id") not in {i.get("id") for i in dead} | targets]
     if ep and (configured or "warm_active" in st or "cold_held" in st):
         active = warm_now(cfg, now)
-        held = cold_now(cfg, now) and bool(r["worker_rows"])
+        held = cold_now(cfg, now) and bool(usable)
         prev = (st.get("warm_active"), st.get("cold_held"))
         st["cold_held"] = held
         want = endpoint_limits(cfg, now, st)
@@ -1713,12 +1764,16 @@ def watch_tick(v, cfg, st, now=None):
             st.pop("cold_held", None)
         # Outside cold_hours nothing should be kept stopped: cold_workers is
         # 0 (just read back), so a stopped worker still listed is billing
-        # storage for nothing. Running workers are left to idle out.
-        if e.get("cold_hours") and not held:
-            cold = [i for i in r["workers"] if _status(i).lower() in ("stopped", "exited")
-                    and i.get("id") not in targets]
+        # storage for nothing. An unavail one can't resume at any hour.
+        # Running workers are left to idle out.
+        if e.get("cold_hours"):
+            cold = [i for i in dead if i.get("id") in by_id]
+            if not held:
+                cold += [i for i in r["workers"] if _stopped(i) and i.get("id") not in targets
+                         and i not in cold]
             for i in cold:
-                actions.append(f"destroy stopped worker outside cold_hours {_describe(i)}")
+                why = "unavail, can't resume" if i in dead else "outside cold_hours"
+                actions.append(f"destroy stopped worker ({why}) {_describe(i)}")
             if cold:
                 destroy_and_wait(v, [i.get("id") for i in cold])
                 for i in cold:
