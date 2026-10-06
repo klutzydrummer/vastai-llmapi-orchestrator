@@ -21,6 +21,8 @@ Endpoints:
                                                worker's last answer; never asks
                                                a worker itself
   GET  /health                                 the shim itself
+  /v1/info, /v1/info.json, /v1/status,         the same, for a proxy that only
+  POST /v1/wake                                passes /v1/* to the shim
 
 Release rule (README, "When a worker is released"): a worker is kept while
 client work is in flight and for inactivity_timeout after it, and only client
@@ -438,6 +440,13 @@ def make_app(shim: Shim):
     app.router.add_get("/info", shim.info_page)
     app.router.add_get("/info.json", shim.info_json)
     app.router.add_post("/wake", shim.wake)
+    # The same page and its calls under /v1 too, for a proxy or tunnel that
+    # only passes /v1/* to the shim. The page's fetches are relative, so from
+    # /v1/info they go to /v1/info.json and /v1/wake.
+    app.router.add_get("/v1/info", shim.info_page)
+    app.router.add_get("/v1/info.json", shim.info_json)
+    app.router.add_get("/v1/status", shim.status)
+    app.router.add_post("/v1/wake", shim.wake)
     app.router.add_post("/v1/chat/completions", lambda r: shim.generate(r, "/v1/chat/completions"))
     app.router.add_post("/v1/completions", lambda r: shim.generate(r, "/v1/completions"))
     app.router.add_post("/v1/embeddings", lambda r: shim.generate(r, "/v1/embeddings"))

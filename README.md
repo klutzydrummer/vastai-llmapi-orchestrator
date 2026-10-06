@@ -365,7 +365,9 @@ come from the worker right after a chat, embedding or wake request succeeds
 (at most every 30 s, `INFO_MIN_INTERVAL`), and the page shows how old they
 are (kept in `shim/.info-cache.json` across restarts, `INFO_CACHE` to move
 it). With `SHIM_API_KEY` set the page asks for the key once and keeps it in
-the browser.
+the browser. If a reverse proxy or tunnel only passes `/v1/*` to the shim,
+open `/v1/info` instead: the same page, whose calls then go to
+`/v1/info.json` and `/v1/wake` (`/v1/status` works too).
 
 **When a worker is released.** Vast's autoscaler releases a running worker
 once the endpoint has seen no activity for `endpoint.inactivity_timeout`

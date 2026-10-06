@@ -256,6 +256,8 @@ async def main():
         async with http.get(base + "/") as r:
             html = await r.text()
         assert r.status == 200 and "Copy all" in html and "info.json" in html
+        async with http.get(base + "/v1/info") as r:   # for a proxy that only passes /v1/*
+            assert r.status == 200 and await r.text() == html
         fake.workers = []
         fake.costs.clear()
         fake.paths.clear()
@@ -318,6 +320,10 @@ async def main():
             assert r.status == 401
         async with http.get(base + "/info") as r:
             assert r.status == 200   # the page has no data of its own; it asks for the key
+        async with http.get(base + "/v1/info.json") as r:
+            assert r.status == 401
+        async with http.get(base + "/v1/info.json", headers={"Authorization": "Bearer secret"}) as r:
+            assert r.status == 200 and "models" in await r.json()
     ok("SHIM_API_KEY enforced")
     await runner.cleanup()
     await frunner.cleanup()
