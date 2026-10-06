@@ -370,7 +370,7 @@ def limited(**changes):
 def example_config_within_limits():
     """the example config passes and reports its worst case"""
     worst = deploy.check_limits(BASE_CFG)
-    assert abs(worst - 1.20) < 1e-9, worst
+    assert abs(worst - 0.80) < 1e-9, worst
 
 
 @case
@@ -997,6 +997,14 @@ def check_sizes_for_the_smallest_allowed_gpu():
 
 
 @case
+def default_example_fits_its_smallest_gpu():
+    """check: the default example's Pantheon Q4_K_M (18,750,500,384 bytes) fits 24 GiB above ctx_min"""
+    assert deploy.smallest_gpu_mib(BASE_CFG) == 24576
+    p = deploy.gpu_memory_plan(BASE_CFG, gemma_files(18_750_500_384), read_header=local_header)
+    assert p["fits"] and BASE_CFG["llama"]["ctx_min"] <= p["ctx"] <= BASE_CFG["llama"]["ctx"], p
+
+
+@case
 def check_fails_a_set_that_cannot_fit_and_lists_options():
     """check: a Q8_0 chat model on 24 GiB fails, says by how much and lists the owner's options without picking one"""
     try:
@@ -1185,8 +1193,8 @@ def download_limits_reach_the_worker():
         assert "compute_cap>=800" in c["workergroup"]["search_params"], c["workergroup"]["search_params"]
         assert "download_min_mbps" not in c["boot"], c["boot"]
     # each budget leaves room for the slowest Hub speed seen so far (~6 MB/s)
-    # on that config's weights (about 29 and 17 GB)
-    assert BASE_CFG["boot"]["download_max_s"] * 6e6 > 29e9 and waifu["boot"]["download_max_s"] * 6e6 > 17e9
+    # on that config's weights (about 21 and 17 GB)
+    assert BASE_CFG["boot"]["download_max_s"] * 6e6 > 21e9 and waifu["boot"]["download_max_s"] * 6e6 > 17e9
 
 
 class LogVast:
