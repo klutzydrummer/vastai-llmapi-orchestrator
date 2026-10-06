@@ -1,4 +1,4 @@
-# Cheaper alternative to config.example.toml: WaifuGemma4 26B-A4B Q4_K_M with
+# Alternative to config.example.toml: WaifuGemma4 26B-A4B Q4_K_M with
 # vision, plus the same Qwen3 embedding model, on 24 GB GPUs at <= $0.40/hr.
 # Copy to deploy/config.toml and edit. VAST_API_KEY comes from the environment.
 # In shim/.env: ENDPOINT_NAME=waifugemma4, SERVED_MODEL_NAME=waifugemma4,
